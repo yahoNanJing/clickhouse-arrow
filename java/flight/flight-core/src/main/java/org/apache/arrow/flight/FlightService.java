@@ -28,16 +28,19 @@ import org.apache.arrow.flight.FlightServerMiddleware.Key;
 import org.apache.arrow.flight.auth.AuthConstants;
 import org.apache.arrow.flight.auth.ServerAuthHandler;
 import org.apache.arrow.flight.auth.ServerAuthWrapper;
+import org.apache.arrow.flight.auth2.Auth2Constants;
 import org.apache.arrow.flight.grpc.ContextPropagatingExecutorService;
+import org.apache.arrow.flight.grpc.RequestContextAdapter;
 import org.apache.arrow.flight.grpc.ServerInterceptorAdapter;
 import org.apache.arrow.flight.grpc.StatusUtils;
 import org.apache.arrow.flight.impl.Flight;
 import org.apache.arrow.flight.impl.FlightServiceGrpc.FlightServiceImplBase;
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.util.AutoCloseables;
-import org.apache.arrow.vector.VectorUnloader;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+
+import com.google.common.base.Strings;
 
 import io.grpc.stub.ServerCallStreamObserver;
 import io.grpc.stub.StreamObserver;
@@ -64,11 +67,25 @@ class FlightService extends FlightServiceImplBase {
   }
 
   private CallContext makeContext(ServerCallStreamObserver<?> responseObserver) {
-    return new CallContext(AuthConstants.PEER_IDENTITY_KEY.get(), responseObserver::isCancelled);
+    // Try to get the peer identity from middleware first (using the auth2 interfaces).
+    final RequestContext context = RequestContextAdapter.REQUEST_CONTEXT_KEY.get();
+    String peerIdentity = null;
+    if (context != null) {
+      peerIdentity = context.get(Auth2Constants.PEER_IDENTITY_KEY);
+    }
+
+    if (Strings.isNullOrEmpty(peerIdentity)) {
+      // Try the legacy auth interface, which defaults to empty string.
+      peerIdentity = AuthConstants.PEER_IDENTITY_KEY.get();
+    }
+
+    return new CallContext(peerIdentity, responseObserver::isCancelled);
   }
 
   @Override
   public StreamObserver<Flight.HandshakeRequest> handshake(StreamObserver<Flight.HandshakeResponse> responseObserver) {
+    // This method is not meaningful with the auth2 interfaces. Authentication would already
+    // have happened by header/middleware with the auth2 classes.
     return ServerAuthWrapper.wrapHandshake(authHandler, responseObserver, executors);
   }
 
@@ -88,6 +105,7 @@ class FlightService extends FlightServiceImplBase {
   public void doGetCustom(Flight.Ticket ticket, StreamObserver<ArrowMessage> responseObserverSimple) {
     final ServerCallStreamObserver<ArrowMessage> responseObserver =
         (ServerCallStreamObserver<ArrowMessage>) responseObserverSimple;
+
     final GetListener listener = new GetListener(responseObserver, this::handleExceptionWithMiddleware);
     try {
       producer.getStream(makeContext(responseObserver), new Ticket(ticket), listener);
@@ -127,8 +145,7 @@ class FlightService extends FlightServiceImplBase {
     private ServerCallStreamObserver<ArrowMessage> responseObserver;
     private final Consumer<Throwable> errorHandler;
     private Runnable onCancelHandler = null;
-    // null until stream started
-    private volatile VectorUnloader unloader;
+    private Runnable onReadyHandler = null;
     private boolean completed;
 
     public GetListener(ServerCallStreamObserver<ArrowMessage> responseObserver, Consumer<Throwable> errorHandler) {
@@ -137,6 +154,7 @@ class FlightService extends FlightServiceImplBase {
       this.completed = false;
       this.responseObserver = responseObserver;
       this.responseObserver.setOnCancelHandler(this::onCancel);
+      this.responseObserver.setOnReadyHandler(this::onReady);
       this.responseObserver.disableAutoInboundFlowControl();
     }
 
@@ -147,9 +165,20 @@ class FlightService extends FlightServiceImplBase {
       }
     }
 
+    private void onReady() {
+      if (onReadyHandler != null) {
+        onReadyHandler.run();
+      }
+    }
+
     @Override
     public void setOnCancelHandler(Runnable handler) {
       this.onCancelHandler = handler;
+    }
+
+    @Override
+    public void setOnReadyHandler(Runnable handler) {
+      this.onReadyHandler = handler;
     }
 
     @Override

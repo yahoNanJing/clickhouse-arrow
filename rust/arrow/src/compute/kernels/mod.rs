@@ -19,14 +19,19 @@
 
 pub mod aggregate;
 pub mod arithmetic;
+pub mod arity;
 pub mod boolean;
 pub mod cast;
+pub mod cast_utils;
 pub mod comparison;
 pub mod concat;
 pub mod filter;
 pub mod length;
 pub mod limit;
+pub mod regexp;
 pub mod sort;
 pub mod substring;
 pub mod take;
 pub mod temporal;
+pub mod window;
+pub mod zip;

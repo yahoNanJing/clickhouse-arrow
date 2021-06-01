@@ -36,7 +36,7 @@
 //! can be obtained via [`is_null(index)`](array::Array::is_null). To downcast an [`Array`](array::Array) to a specific implementation, you can use
 //!
 //! ```rust
-//! use arrow::array::{Array, PrimitiveArrayOps, UInt32Array};
+//! use arrow::array::{Array, UInt32Array};
 //! let array = UInt32Array::from(vec![Some(1), None, Some(3)]);
 //! assert_eq!(array.len(), 3);
 //! assert_eq!(array.value(0), 1);
@@ -52,7 +52,7 @@
 //! # let array = UInt32Array::from(vec![Some(1), None, Some(3)]);
 //! let array: ArrayRef = Arc::new(array);
 //! assert_eq!(array.len(), 3);
-//! // array.value() is not available in the dynamcally-typed version
+//! // array.value() is not available in the dynamically-typed version
 //! assert_eq!(array.is_null(1), true);
 //! assert_eq!(array.data_type(), &DataType::UInt32);
 //! ```
@@ -61,7 +61,7 @@
 //!
 //! ```rust
 //! # use std::sync::Arc;
-//! # use arrow::array::{UInt32Array, ArrayRef, PrimitiveArrayOps};
+//! # use arrow::array::{UInt32Array, ArrayRef};
 //! # let array = UInt32Array::from(vec![Some(1), None, Some(3)]);
 //! # let array: ArrayRef = Arc::new(array);
 //! let array = array.as_any().downcast_ref::<UInt32Array>().unwrap();
@@ -70,8 +70,8 @@
 //!
 //! ## Memory and Buffers
 //!
-//! Data in [`Array`](array::Array) is stored in [`ArrayData`](array::data::ArrayData), that in turn
-//! is a collection of other [`ArrayData`](array::data::ArrayData) and [`Buffers`](buffer::Buffer).
+//! Data in [`Array`](array::Array) is stored in [`ArrayData`](array::ArrayData), that in turn
+//! is a collection of other [`ArrayData`](array::ArrayData) and [`Buffers`](buffer::Buffer).
 //! [`Buffers`](buffer::Buffer) is the central struct that array implementations use keep allocated memory and pointers.
 //! The [`MutableBuffer`](buffer::MutableBuffer) is the mutable counter-part of[`Buffer`](buffer::Buffer).
 //! These are the lowest abstractions of this crate, and are used throughout the crate to
@@ -90,7 +90,7 @@
 //! ## Compute
 //!
 //! This crate offers many operations (called kernels) to operate on `Array`s, that you can find at [compute::kernels].
-//! It has both vertial and horizontal operations, and some of them have an SIMD implementation.
+//! It has both vertical and horizontal operations, and some of them have an SIMD implementation.
 //!
 //! ## Status
 //!
@@ -124,23 +124,39 @@
 //!
 //! The parquet implementation is on a [separate crate](https://crates.io/crates/parquet)
 
-#![feature(specialization)]
+#![cfg_attr(feature = "avx512", feature(stdsimd))]
+#![cfg_attr(feature = "avx512", feature(repr_simd))]
+#![cfg_attr(feature = "avx512", feature(avx512_target_feature))]
 #![allow(dead_code)]
 #![allow(non_camel_case_types)]
+#![deny(clippy::redundant_clone)]
+#![allow(
+    // introduced to ignore lint errors when upgrading from 2020-04-22 to 2020-11-14
+    clippy::float_equality_without_abs,
+    clippy::type_complexity,
+    // upper_case_acronyms lint was introduced in Rust 1.51.
+    // It is triggered in the ffi module, and ipc::gen, which we have no control over
+    clippy::upper_case_acronyms,
+    clippy::vec_init_then_push
+)]
 #![allow(bare_trait_objects)]
 #![warn(missing_debug_implementations)]
-#![deny(clippy::redundant_clone)]
 
+pub mod alloc;
+mod arch;
 pub mod array;
 pub mod bitmap;
 pub mod buffer;
+mod bytes;
 pub mod compute;
 pub mod csv;
 pub mod datatypes;
 pub mod error;
+pub mod ffi;
 pub mod ipc;
 pub mod json;
-pub mod memory;
 pub mod record_batch;
+pub mod temporal_conversions;
 pub mod tensor;
 pub mod util;
+mod zz_memory_check;

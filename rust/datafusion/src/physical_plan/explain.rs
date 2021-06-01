@@ -20,16 +20,16 @@
 use std::any::Any;
 use std::sync::Arc;
 
-use crate::error::{ExecutionError, Result};
+use crate::error::{DataFusionError, Result};
 use crate::{
     logical_plan::StringifiedPlan,
-    physical_plan::{common::RecordBatchIterator, ExecutionPlan},
+    physical_plan::{common::SizedRecordBatchStream, ExecutionPlan},
 };
 use arrow::{array::StringBuilder, datatypes::SchemaRef, record_batch::RecordBatch};
 
 use crate::physical_plan::Partitioning;
 
-use super::SendableRecordBatchReader;
+use super::SendableRecordBatchStream;
 use async_trait::async_trait;
 
 /// Explain execution plan operator. This operator contains the string
@@ -39,7 +39,6 @@ use async_trait::async_trait;
 pub struct ExplainExec {
     /// The schema that this exec plan node outputs
     schema: SchemaRef,
-
     /// The strings to be printed
     stringified_plans: Vec<StringifiedPlan>,
 }
@@ -51,6 +50,11 @@ impl ExplainExec {
             schema,
             stringified_plans,
         }
+    }
+
+    /// The strings to be printed
+    pub fn stringified_plans(&self) -> &[StringifiedPlan] {
+        &self.stringified_plans
     }
 }
 
@@ -82,16 +86,16 @@ impl ExecutionPlan for ExplainExec {
         if children.is_empty() {
             Ok(Arc::new(self.clone()))
         } else {
-            Err(ExecutionError::General(format!(
+            Err(DataFusionError::Internal(format!(
                 "Children cannot be replaced in {:?}",
                 self
             )))
         }
     }
 
-    async fn execute(&self, partition: usize) -> Result<SendableRecordBatchReader> {
+    async fn execute(&self, partition: usize) -> Result<SendableRecordBatchStream> {
         if 0 != partition {
-            return Err(ExecutionError::General(format!(
+            return Err(DataFusionError::Internal(format!(
                 "ExplainExec invalid partition {}",
                 partition
             )));
@@ -102,7 +106,7 @@ impl ExecutionPlan for ExplainExec {
 
         for p in &self.stringified_plans {
             type_builder.append_value(&String::from(&p.plan_type))?;
-            plan_builder.append_value(&p.plan)?;
+            plan_builder.append_value(&*p.plan)?;
         }
 
         let record_batch = RecordBatch::try_new(
@@ -113,7 +117,7 @@ impl ExecutionPlan for ExplainExec {
             ],
         )?;
 
-        Ok(Box::new(RecordBatchIterator::new(
+        Ok(Box::pin(SizedRecordBatchStream::new(
             self.schema.clone(),
             vec![Arc::new(record_batch)],
         )))

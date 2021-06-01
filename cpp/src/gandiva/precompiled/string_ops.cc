@@ -23,6 +23,7 @@ extern "C" {
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
 #include "./types.h"
 
 FORCE_INLINE
@@ -153,6 +154,17 @@ void set_error_for_invalid_utf(int64_t execution_context, char val) {
   snprintf(error, size, fmt, (unsigned char)val);
   gdv_fn_context_set_error_msg(execution_context, error);
   free(error);
+}
+
+FORCE_INLINE
+bool validate_utf8_following_bytes(const char* data, int32_t data_len,
+                                   int32_t char_index) {
+  for (int j = 1; j < data_len; ++j) {
+    if ((data[char_index + j] & 0xC0) != 0x80) {  // bytes following head-byte of glyph
+      return false;
+    }
+  }
+  return true;
 }
 
 // Count the number of utf8 characters
@@ -503,6 +515,22 @@ const char* btrim_utf8_utf8(gdv_int64 context, const char* basetext,
   end_ptr += utf8_char_length(basetext[end_ptr]);  // point to the next character
   *out_len = end_ptr - start_ptr;
   return basetext + start_ptr;
+}
+
+FORCE_INLINE
+const char* castVARCHAR_bool_int64(gdv_int64 context, gdv_boolean value,
+                                   gdv_int64 out_len, gdv_int32* out_length) {
+  gdv_int32 len = static_cast<gdv_int32>(out_len);
+  if (len < 0) {
+    gdv_fn_context_set_error_msg(context, "Output buffer length can't be negative");
+    *out_length = 0;
+    return "";
+  }
+  const char* out =
+      reinterpret_cast<const char*>(gdv_fn_context_arena_malloc(context, 5));
+  out = value ? "true" : "false";
+  *out_length = value ? ((len > 4) ? 4 : len) : ((len > 5) ? 5 : len);
+  return out;
 }
 
 // Truncates the string to given length
@@ -1229,6 +1257,59 @@ const char* convert_fromUTF8_binary(gdv_int64 context, const char* bin_in, gdv_i
   return ret;
 }
 
+FORCE_INLINE
+const char* convert_replace_invalid_fromUTF8_binary(int64_t context, const char* text_in,
+                                                    int32_t text_len,
+                                                    const char* char_to_replace,
+                                                    int32_t char_to_replace_len,
+                                                    int32_t* out_len) {
+  if (char_to_replace_len == 0) {
+    *out_len = text_len;
+    return text_in;
+  } else if (char_to_replace_len != 1) {
+    gdv_fn_context_set_error_msg(context, "Replacement of multiple bytes not supported");
+    *out_len = 0;
+    return "";
+  }
+  // actually the convert_replace function replaces invalid chars with an ASCII
+  // character so the output length will be the same as the input length
+  *out_len = text_len;
+  char* ret = reinterpret_cast<char*>(gdv_fn_context_arena_malloc(context, *out_len));
+  if (ret == nullptr) {
+    gdv_fn_context_set_error_msg(context, "Could not allocate memory for output string");
+    *out_len = 0;
+    return "";
+  }
+  int32_t valid_bytes_to_cpy = 0;
+  int32_t out_byte_counter = 0;
+  int32_t char_len;
+  // scan the base text from left to right and increment the start pointer till
+  // looking for invalid chars to substitute
+  for (int text_index = 0; text_index < text_len; text_index += char_len) {
+    char_len = utf8_char_length(text_in[text_index]);
+    // only memory copy the bytes when detect invalid char
+    if (char_len == 0 || text_index + char_len > text_len ||
+        !validate_utf8_following_bytes(text_in, char_len, text_index)) {
+      // define char_len = 1 to increase text_index by 1 (as ASCII char fits in 1 byte)
+      char_len = 1;
+      // first copy the valid bytes until now and then replace the invalid character
+      memcpy(ret + out_byte_counter, text_in + out_byte_counter, valid_bytes_to_cpy);
+      ret[out_byte_counter + valid_bytes_to_cpy] = char_to_replace[0];
+      out_byte_counter += valid_bytes_to_cpy + char_len;
+      valid_bytes_to_cpy = 0;
+      continue;
+    }
+    valid_bytes_to_cpy += char_len;
+  }
+  // if invalid chars were not found, return the original string
+  if (out_byte_counter == 0) return text_in;
+  // if there are still valid bytes to copy, do it
+  if (valid_bytes_to_cpy != 0) {
+    memcpy(ret + out_byte_counter, text_in + out_byte_counter, valid_bytes_to_cpy);
+  }
+  return ret;
+}
+
 // Search for a string within another string
 FORCE_INLINE
 gdv_int32 locate_utf8_utf8(gdv_int64 context, const char* sub_str, gdv_int32 sub_str_len,
@@ -1438,28 +1519,5 @@ const char* binary_string(gdv_int64 context, const char* text, gdv_int32 text_le
   *out_len = j;
   return ret;
 }
-
-#define CAST_NUMERIC_FROM_STRING(OUT_TYPE, ARROW_TYPE, TYPE_NAME)                       \
-  FORCE_INLINE                                                                          \
-  gdv_##OUT_TYPE cast##TYPE_NAME##_utf8(int64_t context, const char* data,              \
-                                        int32_t len) {                                  \
-    gdv_##OUT_TYPE val = 0;                                                             \
-    int32_t trimmed_len;                                                                \
-    data = btrim_utf8(context, data, len, &trimmed_len);                                \
-    if (!arrow::internal::ParseValue<ARROW_TYPE>(data, trimmed_len, &val)) {            \
-      std::string err = "Failed to cast the string " + std::string(data, trimmed_len) + \
-                        " to " #OUT_TYPE;                                               \
-      gdv_fn_context_set_error_msg(context, err.c_str());                               \
-    }                                                                                   \
-    return val;                                                                         \
-  }
-
-CAST_NUMERIC_FROM_STRING(int32, arrow::Int32Type, INT)
-CAST_NUMERIC_FROM_STRING(int64, arrow::Int64Type, BIGINT)
-CAST_NUMERIC_FROM_STRING(float32, arrow::FloatType, FLOAT4)
-CAST_NUMERIC_FROM_STRING(float64, arrow::DoubleType, FLOAT8)
-
-#undef CAST_INT_FROM_STRING
-#undef CAST_FLOAT_FROM_STRING
 
 }  // extern "C"

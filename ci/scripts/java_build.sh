@@ -30,15 +30,6 @@ if [[ "$(uname -s)" == "Linux" ]] && [[ "$(uname -m)" == "s390x" ]]; then
   wget="wget"
   bintray_base_url="https://dl.bintray.com/apache/arrow"
 
-  bintray_dir="flatc-binary"
-  group="com.github.icexelloss"
-  artifact="flatc-linux-s390_64"
-  ver="1.9.0"
-  extension="exe"
-  target=${artifact}-${ver}.${extension}
-  ${wget} ${bintray_base_url}/${bintray_dir}/${ver}/${target}
-  ${mvn_install} -DgroupId=${group} -DartifactId=${artifact} -Dversion=${ver} -Dpackaging=${extension} -Dfile=$(pwd)/${target}
-
   bintray_dir="protoc-binary"
   group="com.google.protobuf"
   artifact="protoc"
@@ -51,7 +42,9 @@ if [[ "$(uname -s)" == "Linux" ]] && [[ "$(uname -m)" == "s390x" ]]; then
   # protoc requires libprotoc.so.18 libprotobuf.so.18
   ${wget} ${bintray_base_url}/${bintray_dir}/${ver}/libprotoc.so.18
   ${wget} ${bintray_base_url}/${bintray_dir}/${ver}/libprotobuf.so.18
-  export LD_LIBRARY_PATH=${LD_LIBRARY_PATH}:$(pwd)
+  mkdir -p ${ARROW_HOME}/lib
+  cp lib*.so.18 ${ARROW_HOME}/lib
+  export LD_LIBRARY_PATH=${LD_LIBRARY_PATH}:${ARROW_HOME}/lib
 
   bintray_dir="protoc-gen-grpc-java-binary"
   group="io.grpc"

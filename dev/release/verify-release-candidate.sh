@@ -135,17 +135,22 @@ test_binary() {
 }
 
 test_apt() {
-  for target in "debian:stretch" \
-                "arm64v8/debian:stretch" \
+  for target in "debian:bullseye" \
+                "arm64v8/debian:bullseye" \
                 "debian:buster" \
                 "arm64v8/debian:buster" \
-                "ubuntu:xenial" \
-                "arm64v8/ubuntu:xenial" \
                 "ubuntu:bionic" \
                 "arm64v8/ubuntu:bionic" \
                 "ubuntu:focal" \
-                "arm64v8/ubuntu:focal"; do \
+                "arm64v8/ubuntu:focal" \
+                "ubuntu:groovy" \
+                "arm64v8/ubuntu:groovy"; do \
     case "${target}" in
+      arm64v8/debian:bullseye)
+        # qemu-user-static in Ubuntu 20.04 has a crash bug:
+        #   https://bugs.launchpad.net/qemu/+bug/1749393
+        continue
+        ;;
       arm64v8/*)
         if [ "$(arch)" = "aarch64" -o -e /usr/bin/qemu-aarch64-static ]; then
           : # OK
@@ -154,11 +159,11 @@ test_apt() {
         fi
         ;;
     esac
-    if ! docker run -v "${SOURCE_DIR}"/../..:/arrow:delegated \
+    if ! docker run --rm -v "${SOURCE_DIR}"/../..:/arrow:delegated \
            "${target}" \
            /arrow/dev/release/verify-apt.sh \
            "${VERSION}" \
-           "yes" \
+           "rc" \
            "${BINTRAY_REPOSITORY}"; then
       echo "Failed to verify the APT repository for ${target}"
       exit 1
@@ -167,9 +172,7 @@ test_apt() {
 }
 
 test_yum() {
-  for target in "centos:6" \
-                "centos:7" \
-                "arm64v8/centos:7" \
+  for target in "centos:7" \
                 "centos:8" \
                 "arm64v8/centos:8"; do
     case "${target}" in
@@ -181,11 +184,11 @@ test_yum() {
         fi
         ;;
     esac
-    if ! docker run -v "${SOURCE_DIR}"/../..:/arrow:delegated \
+    if ! docker run --rm -v "${SOURCE_DIR}"/../..:/arrow:delegated \
            "${target}" \
            /arrow/dev/release/verify-yum.sh \
            "${VERSION}" \
-           "yes" \
+           "rc" \
            "${BINTRAY_REPOSITORY}"; then
       echo "Failed to verify the Yum repository for ${target}"
       exit 1
@@ -213,11 +216,16 @@ setup_tempdir() {
   fi
 }
 
-
 setup_miniconda() {
   # Setup short-lived miniconda for Python and integration tests
   if [ "$(uname)" == "Darwin" ]; then
-    MINICONDA_URL=https://repo.continuum.io/miniconda/Miniconda3-latest-MacOSX-x86_64.sh
+    if [ "$(uname -m)" == "arm64" ]; then
+	MINICONDA_URL=https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-MacOSX-arm64.sh
+    else
+        MINICONDA_URL=https://repo.continuum.io/miniconda/Miniconda3-latest-MacOSX-x86_64.sh
+    fi
+  elif [ "$(uname)" == "Linux" ] && [ "$(uname -m)" == "aarch64" ]; then
+    MINICONDA_URL=https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-Linux-aarch64.sh
   else
     MINICONDA_URL=https://repo.continuum.io/miniconda/Miniconda3-latest-Linux-x86_64.sh
   fi
@@ -230,16 +238,18 @@ setup_miniconda() {
     bash miniconda.sh -b -p $MINICONDA
     rm -f miniconda.sh
   fi
+  echo "Installed miniconda at ${MINICONDA}"
 
   . $MINICONDA/etc/profile.d/conda.sh
 
   conda create -n arrow-test -y -q -c conda-forge \
-        python=3.6 \
-        nomkl \
-        numpy \
-        pandas \
-        cython
+    python=3.8 \
+    nomkl \
+    numpy \
+    pandas \
+    cython
   conda activate arrow-test
+  echo "Using conda environment ${CONDA_PREFIX}"
 }
 
 # Build and test Java (Requires newer Maven -- I used 3.3.9)
@@ -313,7 +323,7 @@ test_csharp() {
       fi
     fi
   else
-    local dotnet_version=2.2.300
+    local dotnet_version=3.1.405
     local dotnet_platform=
     case "$(uname)" in
       Linux)
@@ -374,7 +384,7 @@ test_python() {
   fi
 
   python setup.py build_ext --inplace
-  py.test pyarrow -v --pdb
+  pytest pyarrow -v --pdb
 
   popd
 }
@@ -382,19 +392,11 @@ test_python() {
 test_glib() {
   pushd c_glib
 
-  if brew --prefix libffi > /dev/null 2>&1; then
-    PKG_CONFIG_PATH=$(brew --prefix libffi)/lib/pkgconfig:$PKG_CONFIG_PATH
-  fi
+  pip install meson
 
-  if [ -f configure ]; then
-    ./configure --prefix=$ARROW_HOME
-    make -j$NPROC
-    make install
-  else
-    meson build --prefix=$ARROW_HOME --libdir=lib
-    ninja -C build
-    ninja -C build install
-  fi
+  meson build --prefix=$ARROW_HOME --libdir=lib
+  ninja -C build
+  ninja -C build install
 
   export GI_TYPELIB_PATH=$ARROW_HOME/lib/girepository-1.0:$GI_TYPELIB_PATH
 
@@ -414,16 +416,17 @@ test_js() {
   if [ "${INSTALL_NODE}" -gt 0 ]; then
     export NVM_DIR="`pwd`/.nvm"
     mkdir -p $NVM_DIR
-    curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.35.3/install.sh | bash
+    curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.35.3/install.sh | \
+      PROFILE=/dev/null bash
     [ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"
 
-    nvm install node
+    nvm install --lts
+    npm install -g yarn
   fi
 
-  npm install
-  # clean, lint, and build JS source
-  npx run-s clean:all lint build
-  npm run test
+  yarn --frozen-lockfile
+  yarn run-s clean:all lint build
+  yarn test
   popd
 }
 
@@ -491,9 +494,7 @@ test_rust() {
   # raises on any formatting errors
   rustup component add rustfmt --toolchain stable
   cargo +stable fmt --all -- --check
-
-  # we are targeting Rust nightly for releases
-  rustup default nightly
+  rustup default stable
 
   # use local modules because we don't publish modules to crates.io yet
   sed \
@@ -633,8 +634,8 @@ IMPORT_TESTS
 }
 
 test_linux_wheels() {
-  local py_arches="3.5m 3.6m 3.7m 3.8"
-  local manylinuxes="1 2010 2014"
+  local py_arches="3.6m 3.7m 3.8 3.9"
+  local manylinuxes="2010 2014"
 
   for py_arch in ${py_arches}; do
     local env=_verify_wheel-${py_arch}
@@ -649,6 +650,7 @@ test_linux_wheels() {
 
       # install test requirements and execute the tests
       pip install -r ${ARROW_DIR}/python/requirements-test.txt
+      python -c 'import pyarrow; pyarrow.create_library_symlinks()'
       pytest --pyargs pyarrow
     done
 
@@ -657,7 +659,7 @@ test_linux_wheels() {
 }
 
 test_macos_wheels() {
-  local py_arches="3.5m 3.6m 3.7m 3.8"
+  local py_arches="3.6m 3.7m 3.8 3.9"
 
   for py_arch in ${py_arches}; do
     local env=_verify_wheel-${py_arch}
@@ -671,6 +673,7 @@ test_macos_wheels() {
 
     # install test requirements and execute the tests
     pip install -r ${ARROW_DIR}/python/requirements-test.txt
+    python -c 'import pyarrow; pyarrow.create_library_symlinks()'
     pytest --pyargs pyarrow
 
     conda deactivate
@@ -690,6 +693,7 @@ test_wheels() {
   fi
 
   python $SOURCE_DIR/download_rc_binaries.py $VERSION $RC_NUMBER \
+         --package_type python \
          --regex=${filter_regex} \
          --dest=${download_dir}
 
@@ -778,15 +782,16 @@ cd ${ARROW_TMPDIR}
 
 if [ ${NEED_MINICONDA} -gt 0 ]; then
   setup_miniconda
-  echo "Using miniconda environment ${MINICONDA}"
 fi
 
 if [ "${ARTIFACT}" == "source" ]; then
   dist_name="apache-arrow-${VERSION}"
   if [ ${TEST_SOURCE} -gt 0 ]; then
     import_gpg_keys
-    fetch_archive ${dist_name}
-    tar xf ${dist_name}.tar.gz
+    if [ ! -d "${dist_name}" ]; then
+      fetch_archive ${dist_name}
+      tar xf ${dist_name}.tar.gz
+    fi
   else
     mkdir -p ${dist_name}
     if [ ! -f ${TEST_ARCHIVE} ]; then

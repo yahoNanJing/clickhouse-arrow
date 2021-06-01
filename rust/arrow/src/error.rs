@@ -17,6 +17,7 @@
 
 //! Defines `ArrowError` for representing failures in various Arrow operations.
 use std::fmt::{Debug, Display, Formatter};
+use std::io::Write;
 
 use csv as csv_crate;
 use std::error::Error;
@@ -24,7 +25,10 @@ use std::error::Error;
 /// Many different operations in the `arrow` crate return this error type.
 #[derive(Debug)]
 pub enum ArrowError {
+    /// Returned when functionality is not yet available.
+    NotYetImplemented(String),
     ExternalError(Box<dyn Error + Send + Sync>),
+    CastError(String),
     MemoryError(String),
     ParseError(String),
     SchemaError(String),
@@ -35,6 +39,8 @@ pub enum ArrowError {
     IoError(String),
     InvalidArgumentError(String),
     ParquetError(String),
+    /// Error during import or export to/from the C Data Interface
+    CDataInterface(String),
     DictionaryKeyOverflowError,
 }
 
@@ -58,7 +64,7 @@ impl From<csv_crate::Error> for ArrowError {
         match error.kind() {
             csv_crate::ErrorKind::Io(error) => ArrowError::CsvError(error.to_string()),
             csv_crate::ErrorKind::Utf8 { pos: _, err } => ArrowError::CsvError(format!(
-                "Encountered UTF-8 error while reading CSV file: {:?}",
+                "Encountered UTF-8 error while reading CSV file: {}",
                 err.to_string()
             )),
             csv_crate::ErrorKind::UnequalLengths {
@@ -79,10 +85,26 @@ impl From<::std::string::FromUtf8Error> for ArrowError {
     }
 }
 
+impl From<serde_json::Error> for ArrowError {
+    fn from(error: serde_json::Error) -> Self {
+        ArrowError::JsonError(error.to_string())
+    }
+}
+
+impl<W: Write> From<::std::io::IntoInnerError<W>> for ArrowError {
+    fn from(error: std::io::IntoInnerError<W>) -> Self {
+        ArrowError::IoError(error.to_string())
+    }
+}
+
 impl Display for ArrowError {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
+            ArrowError::NotYetImplemented(source) => {
+                write!(f, "Not yet implemented: {}", &source)
+            }
             ArrowError::ExternalError(source) => write!(f, "External error: {}", &source),
+            ArrowError::CastError(desc) => write!(f, "Cast error: {}", desc),
             ArrowError::MemoryError(desc) => write!(f, "Memory error: {}", desc),
             ArrowError::ParseError(desc) => write!(f, "Parser error: {}", desc),
             ArrowError::SchemaError(desc) => write!(f, "Schema error: {}", desc),
@@ -96,6 +118,9 @@ impl Display for ArrowError {
             }
             ArrowError::ParquetError(desc) => {
                 write!(f, "Parquet argument error: {}", desc)
+            }
+            ArrowError::CDataInterface(desc) => {
+                write!(f, "C Data interface error: {}", desc)
             }
             ArrowError::DictionaryKeyOverflowError => {
                 write!(f, "Dictionary key bigger than the key type")

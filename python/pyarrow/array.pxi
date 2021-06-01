@@ -152,6 +152,7 @@ def array(object obj, type=None, mask=None, size=None, from_pandas=None,
     -------
     array : pyarrow.Array or pyarrow.ChunkedArray
         A ChunkedArray instead of an Array is returned if:
+
         - the object data overflowed binary storage.
         - the object's ``__arrow_array__`` protocol method returned a chunked
           array.
@@ -237,6 +238,15 @@ def array(object obj, type=None, mask=None, size=None, from_pandas=None,
                 # don't use shrunken masks
                 mask = None if values.mask is np.ma.nomask else values.mask
                 values = values.data
+
+        if mask is not None:
+            if mask.dtype != np.bool_:
+                raise TypeError("Mask must be boolean dtype")
+            if mask.ndim != 1:
+                raise ValueError("Mask must be 1D array")
+            if len(values) != len(mask):
+                raise ValueError(
+                    "Mask is a different length from sequence being converted")
 
         if hasattr(values, '__arrow_array__'):
             return _handle_arrow_array_protocol(values, type, mask, size)
@@ -527,7 +537,8 @@ def _normalize_slice(object arrow_obj, slice key):
         indices = np.arange(start, stop, step)
         return arrow_obj.take(indices)
     else:
-        return arrow_obj.slice(start, stop - start)
+        length = max(stop - start, 0)
+        return arrow_obj.slice(start, length)
 
 
 cdef Py_ssize_t _normalize_index(Py_ssize_t index,
@@ -713,6 +724,10 @@ cdef class _PandasConvertible(_Weakrefable):
             memory while converting the Arrow object to pandas. If you use the
             object after calling to_pandas with this option it will crash your
             program.
+
+            Note that you may not see always memory usage improvements. For
+            example, if multiple columns share an underlying allocation,
+            memory can't be freed until all columns are converted.
         types_mapper : function, default None
             A function mapping a pyarrow DataType to a pandas ExtensionDtype.
             This can be used to override the default pandas type for conversion
@@ -833,11 +848,12 @@ cdef class Array(_PandasConvertible):
         """
         return _pc().call_function('unique', [self])
 
-    def dictionary_encode(self):
+    def dictionary_encode(self, null_encoding='mask'):
         """
         Compute dictionary-encoded representation of array.
         """
-        return _pc().call_function('dictionary_encode', [self])
+        options = _pc().DictionaryEncodeOptions(null_encoding)
+        return _pc().call_function('dictionary_encode', [self], options)
 
     def value_counts(self):
         """
@@ -1006,9 +1022,11 @@ cdef class Array(_PandasConvertible):
         try:
             return self.equals(other)
         except TypeError:
+            # This also handles comparing with None
+            # as Array.equals(None) raises a TypeError.
             return NotImplemented
 
-    def equals(Array self, Array other):
+    def equals(Array self, Array other not None):
         return self.ap.Equals(deref(other.ap))
 
     def __len__(self):
@@ -1086,6 +1104,8 @@ cdef class Array(_PandasConvertible):
         if length is None:
             result = self.ap.Slice(offset)
         else:
+            if length < 0:
+                raise ValueError('Length must be non-negative')
             result = self.ap.Slice(offset, length)
 
         return pyarrow_wrap_array(result)
@@ -1484,6 +1504,12 @@ cdef class FixedSizeBinaryArray(Array):
 cdef class Decimal128Array(FixedSizeBinaryArray):
     """
     Concrete class for Arrow arrays of decimal128 data type.
+    """
+
+
+cdef class Decimal256Array(FixedSizeBinaryArray):
+    """
+    Concrete class for Arrow arrays of decimal256 data type.
     """
 
 cdef class BaseListArray(Array):
@@ -2228,10 +2254,19 @@ cdef class ExtensionArray(Array):
         return result
 
     def _to_pandas(self, options, **kwargs):
-        result = Array._to_pandas(self, options, **kwargs)
-        # TODO(wesm): is passing through these parameters to the storage array
-        # correct?
-        return result.to_pandas(options, **kwargs)
+        pandas_dtype = None
+        try:
+            pandas_dtype = self.type.to_pandas_dtype()
+        except NotImplementedError:
+            pass
+
+        # pandas ExtensionDtype that implements conversion from pyarrow
+        if hasattr(pandas_dtype, '__from_arrow__'):
+            arr = pandas_dtype.__from_arrow__(self)
+            return pandas_api.series(arr)
+
+        # otherwise convert the storage array with the base implementation
+        return Array._to_pandas(self.storage, options, **kwargs)
 
     def to_numpy(self, **kwargs):
         """
@@ -2276,7 +2311,8 @@ cdef dict _array_classes = {
     _Type_LARGE_STRING: LargeStringArray,
     _Type_DICTIONARY: DictionaryArray,
     _Type_FIXED_SIZE_BINARY: FixedSizeBinaryArray,
-    _Type_DECIMAL: Decimal128Array,
+    _Type_DECIMAL128: Decimal128Array,
+    _Type_DECIMAL256: Decimal256Array,
     _Type_STRUCT: StructArray,
     _Type_EXTENSION: ExtensionArray,
 }

@@ -23,8 +23,26 @@
 #include <arrow/filesystem/localfs.h>
 
 namespace fs = ::arrow::fs;
+namespace io = ::arrow::io;
 
-// FileInfo
+namespace cpp11 {
+
+const char* r6_class_name<fs::FileSystem>::get(
+    const std::shared_ptr<fs::FileSystem>& file_system) {
+  auto type_name = file_system->type_name();
+
+  if (type_name == "local") {
+    return "LocalFileSystem";
+  } else if (type_name == "s3") {
+    return "S3FileSystem";
+  } else if (type_name == "subtree") {
+    return "SubTreeFileSystem";
+  } else {
+    return "FileSystem";
+  }
+}
+
+}  // namespace cpp11
 
 // [[arrow::export]]
 fs::FileType fs___FileInfo__type(const std::shared_ptr<fs::FileInfo>& x) {
@@ -123,19 +141,20 @@ std::vector<std::shared_ptr<T>> shared_ptr_vector(const std::vector<T>& vec) {
 }
 
 // [[arrow::export]]
-std::vector<std::shared_ptr<fs::FileInfo>> fs___FileSystem__GetTargetInfos_Paths(
+cpp11::list fs___FileSystem__GetTargetInfos_Paths(
     const std::shared_ptr<fs::FileSystem>& file_system,
     const std::vector<std::string>& paths) {
   auto results = ValueOrStop(file_system->GetFileInfo(paths));
-  return shared_ptr_vector(results);
+  return arrow::r::to_r_list(shared_ptr_vector(results));
 }
 
 // [[arrow::export]]
-std::vector<std::shared_ptr<fs::FileInfo>> fs___FileSystem__GetTargetInfos_FileSelector(
+cpp11::list fs___FileSystem__GetTargetInfos_FileSelector(
     const std::shared_ptr<fs::FileSystem>& file_system,
     const std::shared_ptr<fs::FileSelector>& selector) {
   auto results = ValueOrStop(file_system->GetFileInfo(*selector));
-  return shared_ptr_vector(results);
+
+  return arrow::r::to_r_list(shared_ptr_vector(results));
 }
 
 // [[arrow::export]]
@@ -212,7 +231,9 @@ std::string fs___FileSystem__type_name(
 
 // [[arrow::export]]
 std::shared_ptr<fs::LocalFileSystem> fs___LocalFileSystem__create() {
-  return std::make_shared<fs::LocalFileSystem>();
+  // Affects OpenInputFile/OpenInputStream
+  auto io_context = arrow::io::IOContext(gc_memory_pool());
+  return std::make_shared<fs::LocalFileSystem>(io_context);
 }
 
 // [[arrow::export]]
@@ -238,8 +259,9 @@ cpp11::writable::list fs___FileSystemFromUri(const std::string& path) {
   using cpp11::literals::operator"" _nm;
 
   std::string out_path;
-  auto file_system = ValueOrStop(fs::FileSystemFromUri(path, &out_path));
-  return cpp11::writable::list({"fs"_nm = file_system, "path"_nm = out_path});
+  return cpp11::writable::list(
+      {"fs"_nm = cpp11::to_r6(ValueOrStop(fs::FileSystemFromUri(path, &out_path))),
+       "path"_nm = out_path});
 }
 
 // [[arrow::export]]
@@ -249,7 +271,7 @@ void fs___CopyFiles(const std::shared_ptr<fs::FileSystem>& source_fs,
                     const std::string& destination_base_dir,
                     int64_t chunk_size = 1024 * 1024, bool use_threads = true) {
   StopIfNotOk(fs::CopyFiles(source_fs, *source_sel, destination_fs, destination_base_dir,
-                            chunk_size, use_threads));
+                            io::default_io_context(), chunk_size, use_threads));
 }
 
 #endif
@@ -295,7 +317,8 @@ std::shared_ptr<fs::S3FileSystem> fs___S3FileSystem__create(
   s3_opts.background_writes = background_writes;
 
   StopIfNotOk(fs::EnsureS3Initialized());
-  return ValueOrStop(fs::S3FileSystem::Make(s3_opts));
+  auto io_context = arrow::io::IOContext(gc_memory_pool());
+  return ValueOrStop(fs::S3FileSystem::Make(s3_opts, io_context));
 }
 
 // [[s3::export]]

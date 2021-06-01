@@ -21,7 +21,7 @@
 
 [![Coverage Status](https://codecov.io/gh/apache/arrow/rust/branch/master/graph/badge.svg)](https://codecov.io/gh/apache/arrow?branch=master)
 
-Welcome to the implementation of Arrow, the popular in-memory columnar format, in Rust.
+Welcome to the implementation of Arrow, the popular in-memory columnar format, in [Rust](https://www.rust-lang.org/).
 
 This part of the Arrow project is divided in 4 main components:
 
@@ -31,12 +31,13 @@ This part of the Arrow project is divided in 4 main components:
 |Parquet      | Parquet support | [(README)](parquet/README.md) |
 |Arrow-flight | Arrow data between processes | [(README)](arrow-flight/README.md) |
 |DataFusion   | In-memory query engine with SQL support | [(README)](datafusion/README.md) |
+|Ballista     | Distributed query execution | [(README)](ballista/README.md) |
 
 Independently, they support a vast array of functionality for in-memory computations.
 
-Together, they allow users to write an SQL query or a `DataFrame` (using `datafusion` crate), run it against a parquet file (using `parquet` crate), evaluate it in-memory using Arrow's columnar format (using the `arrow` crate), and send to another process (using `arrow-flight` crate).
+Together, they allow users to write an SQL query or a `DataFrame` (using the `datafusion` crate), run it against a parquet file (using the `parquet` crate), evaluate it in-memory using Arrow's columnar format (using the `arrow` crate), and send to another process (using the `arrow-flight` crate).
 
-Generally speaking, the `arrow` crate offers the  functionality to develop code that uses Arrow arrays, and `datafusion` offers most operations typically found in SQL, with the notable exceptions of:
+Generally speaking, the `arrow` crate offers functionality to develop code that uses Arrow arrays, and `datafusion` offers most operations typically found in SQL, with the notable exceptions of:
 
 * `join`
 * `window` functions
@@ -48,13 +49,50 @@ There are too many features to enumerate here, but some notable mentions:
 * `DataFusion` supports `async` execution
 * `DataFusion` supports user-defined functions, aggregates, and whole execution nodes
 
-You can find more details about each crate on their respective READMEs.
+You can find more details about each crate in their respective READMEs.
+
+## Arrow Rust Community
+
+We use the official [ASF Slack](https://s.apache.org/slack-invite) for informal discussions and coordination. This is 
+a great place to meet other contributors and get guidance on where to contribute. Join us in the `arrow-rust` channel.
+
+We use [ASF JIRA](https://issues.apache.org/jira/secure/Dashboard.jspa) as the system of record for new features
+and bug fixes and this plays a critical role in the release process.
+
+For design discussions we generally collaborate on Google documents and file a JIRA linking to the document.
+
+There is also a bi-weekly Rust-specific sync call for the Arrow Rust community. This is hosted on Google Meet
+at https://meet.google.com/ctp-yujs-aee on alternate Wednesday's at 09:00 US/Pacific, 12:00 US/Eastern. During 
+US daylight savings time this corresponds to 16:00 UTC and at other times this is 17:00 UTC.
 
 ## Developer's guide to Arrow Rust
 
-Before running tests and examples, it is necessary to set up the local development environment.
+### How to compile
+
+This is a standard cargo project with workspaces. To build it, you need to have `rust` and `cargo`:
+
+```bash
+cd /rust && cargo build
+```
+
+You can also use rust's official docker image:
+
+```bash
+docker run --rm -v $(pwd)/rust:/rust -it rust /bin/bash -c "cd /rust && cargo build"
+```
+
+The command above assumes that are in the root directory of the project, not in the same
+directory as this README.md.
+
+You can also compile specific workspaces:
+
+```bash
+cd /rust/arrow && cargo build
+```
 
 ### Git Submodules
+
+Before running tests and examples, it is necessary to set up the local development environment.
 
 The tests rely on test data that is contained in git submodules.
 
@@ -69,29 +107,35 @@ This populates data in two git submodules:
 - `../cpp/submodules/parquet_testing/data` (sourced from https://github.com/apache/parquet-testing.git)
 - `../testing` (sourced from https://github.com/apache/arrow-testing)
 
-To run the tests of the whole crate, create two new environment variables to point to these directories as follows:
+By default, `cargo test` will look for these directories at their
+standard location. The following environment variables can be used to override the location:
 
 ```bash
-export PARQUET_TEST_DATA=../cpp/submodules/parquet-testing/data
-export ARROW_TEST_DATA=../testing/data
+# Optionaly specify a different location for test data
+export PARQUET_TEST_DATA=$(cd ../cpp/submodules/parquet-testing/data; pwd)
+export ARROW_TEST_DATA=$(cd ../testing/data; pwd)
 ```
 
-To run the tests of an individual crate within the project (e.g. in `datafusion/`), adjust the path
-accordingly:
+From here on, this is a pure Rust project and `cargo` can be used to run tests, benchmarks, docs and examples as usual.
+
+
+### Running the tests
+
+Run tests using the Rust standard `cargo test` command:
 
 ```bash
-export PARQUET_TEST_DATA=../../cpp/submodules/parquet-testing/data
-export ARROW_TEST_DATA=../../testing/data
-```
+# run all tests.
+cargo test
 
-from here on, this is a pure Rust project and `cargo` can be used to run tests, benchmarks, docs and examples as usual.
+
+# run only tests for the arrow crate
+cargo test -p arrow
+```
 
 ## Code Formatting
 
-Our CI uses `rustfmt` to check code formatting.  Although the project is
-built and tested against nightly rust we use the stable version of
-`rustfmt`.  So before submitting a PR be sure to run the following
-and check for lint issues:
+Our CI uses `rustfmt` to check code formatting. Before submitting a
+PR be sure to run the following and check for lint issues:
 
 ```bash
 cargo +stable fmt --all -- --check
@@ -116,18 +160,27 @@ Search for `allow(clippy::` in the codebase to identify lints that are ignored/a
 * If you have several lints on a function or module, you may disable the lint on the function or module.
 * If a lint is pervasive across multiple modules, you may disable it at the crate level.
 
-## CI and Dockerized builds
+## Git Pre-Commit Hook
 
-There are currently multiple CI systems that build the project and they all use the same docker image. It is possible to run the same build locally.
+We can use [git pre-commit hook](https://git-scm.com/book/en/v2/Customizing-Git-Git-Hooks) to automate various kinds of git pre-commit checking/formatting.
 
-From the root of the Arrow project, run the following command to build the Docker image that the CI system uses to build the project.
+Suppose you are in the root directory of the project.
+
+First check if the file already exists:
 
 ```bash
-docker-compose build debian-rust
+ls -l .git/hooks/pre-commit
 ```
 
-Run the following command to build the project in the same way that the CI system will build the project. Note that this currently does cause some files to be written to your local workspace.
+If the file already exists, to avoid mistakenly **overriding**, you MAY have to check
+the link source or file content. Else if not exist, let's safely soft link [pre-commit.sh](pre-commit.sh) as file `.git/hooks/pre-commit`:
+
+```
+ln -s  ../../rust/pre-commit.sh .git/hooks/pre-commit
+```
+
+If sometimes you want to commit without checking, just run `git commit` with `--no-verify`:
 
 ```bash
-docker-compose run --rm debian-rust bash
+git commit --no-verify -m "... commit message ..."
 ```

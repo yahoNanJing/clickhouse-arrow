@@ -22,8 +22,9 @@
 #include <vector>
 
 #include "arrow/dataset/dataset_internal.h"
-#include "arrow/dataset/filter.h"
+#include "arrow/dataset/scanner_internal.h"
 #include "arrow/dataset/test_util.h"
+#include "arrow/io/memory.h"
 #include "arrow/record_batch.h"
 #include "arrow/table.h"
 #include "arrow/testing/gtest_util.h"
@@ -31,6 +32,7 @@
 #include "arrow/type.h"
 #include "arrow/type_fwd.h"
 #include "arrow/util/range.h"
+
 #include "parquet/arrow/writer.h"
 #include "parquet/metadata.h"
 
@@ -138,9 +140,8 @@ class TestParquetFileFormat : public ArrowParquetWriterMixin {
   }
 
   std::unique_ptr<RecordBatchReader> GetRecordBatchReader(
-      std::shared_ptr<Schema> schema = nullptr) {
-    return MakeGeneratedRecordBatch(schema ? schema : schema_, kBatchSize,
-                                    kBatchRepetitions);
+      std::shared_ptr<Schema> schema) {
+    return MakeGeneratedRecordBatch(schema, kBatchSize, kBatchRepetitions);
   }
 
   Result<std::shared_ptr<io::BufferOutputStream>> GetFileSink() {
@@ -156,8 +157,12 @@ class TestParquetFileFormat : public ArrowParquetWriterMixin {
   }
 
   RecordBatchIterator Batches(Fragment* fragment) {
-    EXPECT_OK_AND_ASSIGN(auto scan_task_it, fragment->Scan(opts_, ctx_));
+    EXPECT_OK_AND_ASSIGN(auto scan_task_it, fragment->Scan(opts_));
     return Batches(std::move(scan_task_it));
+  }
+
+  void SetFilter(Expression filter) {
+    ASSERT_OK_AND_ASSIGN(opts_->filter, filter.Bind(*opts_->dataset_schema));
   }
 
   std::shared_ptr<RecordBatch> SingleBatch(Fragment* fragment) {
@@ -187,34 +192,39 @@ class TestParquetFileFormat : public ArrowParquetWriterMixin {
   }
 
   void CountRowGroupsInFragment(const std::shared_ptr<Fragment>& fragment,
-                                std::vector<int> expected_row_groups,
-                                const Expression& filter) {
+                                std::vector<int> expected_row_groups, Expression filter) {
+    SetFilter(filter);
+
     auto parquet_fragment = checked_pointer_cast<ParquetFileFragment>(fragment);
-    ASSERT_OK_AND_ASSIGN(auto fragments, parquet_fragment->SplitByRowGroup(filter.Copy()))
+    ASSERT_OK_AND_ASSIGN(auto fragments, parquet_fragment->SplitByRowGroup(opts_->filter))
 
     EXPECT_EQ(fragments.size(), expected_row_groups.size());
     for (size_t i = 0; i < fragments.size(); i++) {
       auto expected = expected_row_groups[i];
       auto parquet_fragment = checked_pointer_cast<ParquetFileFragment>(fragments[i]);
 
-      EXPECT_EQ(*parquet_fragment->row_groups(),
-                RowGroupInfo::FromIdentifiers({expected}));
+      EXPECT_EQ(parquet_fragment->row_groups(), std::vector<int>{expected});
       EXPECT_EQ(SingleBatch(parquet_fragment.get())->num_rows(), expected + 1);
     }
   }
 
+  void SetSchema(std::vector<std::shared_ptr<Field>> fields) {
+    opts_ = std::make_shared<ScanOptions>();
+    opts_->dataset_schema = schema(std::move(fields));
+    ASSERT_OK(SetProjection(opts_.get(), opts_->dataset_schema->field_names()));
+  }
+
  protected:
-  std::shared_ptr<Schema> schema_ = schema({field("f64", float64())});
   std::shared_ptr<ParquetFileFormat> format_ = std::make_shared<ParquetFileFormat>();
   std::shared_ptr<ScanOptions> opts_;
-  std::shared_ptr<ScanContext> ctx_ = std::make_shared<ScanContext>();
 };
 
 TEST_F(TestParquetFileFormat, ScanRecordBatchReader) {
-  auto reader = GetRecordBatchReader();
+  auto reader = GetRecordBatchReader(schema({field("f64", float64())}));
   auto source = GetFileSource(reader.get());
 
-  opts_ = ScanOptions::Make(reader->schema());
+  SetSchema(reader->schema()->fields());
+  SetFilter(literal(true));
   ASSERT_OK_AND_ASSIGN(auto fragment, format_->MakeFragment(*source));
 
   int64_t row_count = 0;
@@ -228,17 +238,16 @@ TEST_F(TestParquetFileFormat, ScanRecordBatchReader) {
 }
 
 TEST_F(TestParquetFileFormat, ScanRecordBatchReaderDictEncoded) {
-  schema_ = schema({field("utf8", utf8())});
-
-  auto reader = GetRecordBatchReader();
+  auto reader = GetRecordBatchReader(schema({field("utf8", utf8())}));
   auto source = GetFileSource(reader.get());
 
-  opts_ = ScanOptions::Make(reader->schema());
+  SetSchema(reader->schema()->fields());
+  SetFilter(literal(true));
 
   format_->reader_options.dict_columns = {"utf8"};
   ASSERT_OK_AND_ASSIGN(auto fragment, format_->MakeFragment(*source));
 
-  ASSERT_OK_AND_ASSIGN(auto scan_task_it, fragment->Scan(opts_, ctx_));
+  ASSERT_OK_AND_ASSIGN(auto scan_task_it, fragment->Scan(opts_));
   int64_t row_count = 0;
 
   Schema expected_schema({field("utf8", dictionary(int32(), utf8()))});
@@ -256,6 +265,36 @@ TEST_F(TestParquetFileFormat, ScanRecordBatchReaderDictEncoded) {
   ASSERT_EQ(row_count, kNumRows);
 }
 
+TEST_F(TestParquetFileFormat, ScanRecordBatchReaderPreBuffer) {
+  auto reader = GetRecordBatchReader(schema({field("f64", float64())}));
+  auto source = GetFileSource(reader.get());
+
+  SetSchema(reader->schema()->fields());
+  SetFilter(literal(true));
+
+  ASSERT_OK_AND_ASSIGN(auto fragment, format_->MakeFragment(*source));
+  auto fragment_scan_options = std::make_shared<ParquetFragmentScanOptions>();
+  fragment_scan_options->arrow_reader_properties->set_pre_buffer(true);
+  opts_->fragment_scan_options = fragment_scan_options;
+  ASSERT_OK_AND_ASSIGN(auto scan_task_it, fragment->Scan(opts_));
+
+  int64_t task_count = 0;
+  int64_t row_count = 0;
+
+  for (auto maybe_task : scan_task_it) {
+    ASSERT_OK_AND_ASSIGN(auto task, maybe_task);
+    task_count += 1;
+    ASSERT_OK_AND_ASSIGN(auto rb_it, task->Execute());
+    for (auto maybe_batch : rb_it) {
+      ASSERT_OK_AND_ASSIGN(auto batch, maybe_batch);
+      row_count += batch->num_rows();
+    }
+  }
+
+  ASSERT_EQ(task_count, kBatchRepetitions);
+  ASSERT_EQ(row_count, kNumRows);
+}
+
 TEST_F(TestParquetFileFormat, OpenFailureWithRelevantError) {
   std::shared_ptr<Buffer> buf = std::make_shared<Buffer>(util::string_view(""));
   auto result = format_->Inspect(FileSource(buf));
@@ -270,19 +309,22 @@ TEST_F(TestParquetFileFormat, OpenFailureWithRelevantError) {
                                   result.status());
 }
 
+static auto f32 = field("f32", float32());
+static auto f64 = field("f64", float64());
+static auto i32 = field("i32", int32());
+static auto i64 = field("i64", int64());
+
 TEST_F(TestParquetFileFormat, ScanRecordBatchReaderProjected) {
-  schema_ = schema({field("f64", float64()), field("i64", int64()),
-                    field("f32", float32()), field("i32", int32())});
+  SetSchema({f64, i64, f32, i32});
+  ASSERT_OK(SetProjection(opts_.get(), {"f64"}));
+  SetFilter(equal(field_ref("i32"), literal(0)));
 
-  opts_ = ScanOptions::Make(schema_);
-  opts_->projector = RecordBatchProjector(SchemaFromColumnNames(schema_, {"f64"}));
-  opts_->filter = equal(field_ref("i32"), scalar(0));
+  // NB: projection is applied by the scanner; FileFragment does not evaluate it so
+  // we will not drop "i32" even though it is not projected since we need it for
+  // filtering
+  auto expected_schema = schema({f64, i32});
 
-  // NB: projector is applied by the scanner; FileFragment does not evaluate it so
-  // we will not drop "i32" even though it is not in the projector's schema
-  auto expected_schema = schema({field("f64", float64()), field("i32", int32())});
-
-  auto reader = GetRecordBatchReader();
+  auto reader = GetRecordBatchReader(opts_->dataset_schema);
   auto source = GetFileSource(reader.get());
   ASSERT_OK_AND_ASSIGN(auto fragment, format_->MakeFragment(*source));
 
@@ -299,38 +341,32 @@ TEST_F(TestParquetFileFormat, ScanRecordBatchReaderProjected) {
 }
 
 TEST_F(TestParquetFileFormat, ScanRecordBatchReaderProjectedMissingCols) {
-  auto reader_without_i32 = GetRecordBatchReader(
-      schema({field("f64", float64()), field("i64", int64()), field("f32", float32())}));
+  SetSchema({f64, i64, f32, i32});
+  ASSERT_OK(SetProjection(opts_.get(), {"f64"}));
+  SetFilter(equal(field_ref("i32"), literal(0)));
 
-  auto reader_without_f64 = GetRecordBatchReader(
-      schema({field("i64", int64()), field("f32", float32()), field("i32", int32())}));
-
-  auto reader =
-      GetRecordBatchReader(schema({field("f64", float64()), field("i64", int64()),
-                                   field("f32", float32()), field("i32", int32())}));
-
-  schema_ = reader->schema();
-  opts_ = ScanOptions::Make(schema_);
-  opts_->projector = RecordBatchProjector(SchemaFromColumnNames(schema_, {"f64"}));
-  opts_->filter = equal(field_ref("i32"), scalar(0));
+  auto reader_without_i32 = GetRecordBatchReader(schema({f64, i64, f32}));
+  auto reader_without_f64 = GetRecordBatchReader(schema({i64, f32, i32}));
+  auto reader = GetRecordBatchReader(schema({f64, i64, f32, i32}));
 
   auto readers = {reader.get(), reader_without_i32.get(), reader_without_f64.get()};
   for (auto reader : readers) {
     auto source = GetFileSource(reader);
     ASSERT_OK_AND_ASSIGN(auto fragment, format_->MakeFragment(*source));
 
-    // NB: projector is applied by the scanner; ParquetFragment does not evaluate it.
-    // We will not drop "i32" even though it is not in the projector's schema.
+    // NB: projection is applied by the scanner; FileFragment does not evaluate it so
+    // we will not drop "i32" even though it is not projected since we need it for
+    // filtering
     //
     // in the case where a file doesn't contain a referenced field, we won't
-    // materialize it (the filter/projector will populate it with nulls later)
+    // materialize it as nulls later
     std::shared_ptr<Schema> expected_schema;
     if (reader == reader_without_i32.get()) {
-      expected_schema = schema({field("f64", float64())});
+      expected_schema = schema({f64});
     } else if (reader == reader_without_f64.get()) {
-      expected_schema = schema({field("i32", int32())});
+      expected_schema = schema({i32});
     } else {
-      expected_schema = schema({field("f64", float64()), field("i32", int32())});
+      expected_schema = schema({f64, i32});
     }
 
     int64_t row_count = 0;
@@ -347,17 +383,15 @@ TEST_F(TestParquetFileFormat, ScanRecordBatchReaderProjectedMissingCols) {
 }
 
 TEST_F(TestParquetFileFormat, Inspect) {
-  auto reader = GetRecordBatchReader();
+  auto reader = GetRecordBatchReader(schema({field("f64", float64())}));
   auto source = GetFileSource(reader.get());
 
   ASSERT_OK_AND_ASSIGN(auto actual, format_->Inspect(*source.get()));
-  AssertSchemaEqual(*actual, *schema_, /*check_metadata=*/false);
+  AssertSchemaEqual(*actual, *reader->schema(), /*check_metadata=*/false);
 }
 
 TEST_F(TestParquetFileFormat, InspectDictEncoded) {
-  schema_ = schema({field("utf8", utf8())});
-
-  auto reader = GetRecordBatchReader();
+  auto reader = GetRecordBatchReader(schema({field("utf8", utf8())}));
   auto source = GetFileSource(reader.get());
 
   format_->reader_options.dict_columns = {"utf8"};
@@ -368,7 +402,7 @@ TEST_F(TestParquetFileFormat, InspectDictEncoded) {
 }
 
 TEST_F(TestParquetFileFormat, IsSupported) {
-  auto reader = GetRecordBatchReader();
+  auto reader = GetRecordBatchReader(schema({field("f64", float64())}));
   auto source = GetFileSource(reader.get());
 
   bool supported = false;
@@ -404,35 +438,37 @@ TEST_F(TestParquetFileFormat, PredicatePushdown) {
   auto reader = ArithmeticDatasetFixture::GetRecordBatchReader(kNumRowGroups);
   auto source = GetFileSource(reader.get());
 
-  opts_ = ScanOptions::Make(reader->schema());
+  SetSchema(reader->schema()->fields());
   ASSERT_OK_AND_ASSIGN(auto fragment, format_->MakeFragment(*source));
 
-  opts_->filter = scalar(true);
+  SetFilter(literal(true));
   CountRowsAndBatchesInScan(fragment, kTotalNumRows, kNumRowGroups);
 
   for (int64_t i = 1; i <= kNumRowGroups; i++) {
-    opts_->filter = ("i64"_ == int64_t(i)).Copy();
+    SetFilter(equal(field_ref("i64"), literal(i)));
     CountRowsAndBatchesInScan(fragment, i, 1);
   }
 
   // Out of bound filters should skip all RowGroups.
-  opts_->filter = scalar(false);
+  SetFilter(literal(false));
   CountRowsAndBatchesInScan(fragment, 0, 0);
-  opts_->filter = ("i64"_ == int64_t(kNumRowGroups + 1)).Copy();
+  SetFilter(equal(field_ref("i64"), literal<int64_t>(kNumRowGroups + 1)));
   CountRowsAndBatchesInScan(fragment, 0, 0);
-  opts_->filter = ("i64"_ == int64_t(-1)).Copy();
+  SetFilter(equal(field_ref("i64"), literal<int64_t>(-1)));
   CountRowsAndBatchesInScan(fragment, 0, 0);
   // No rows match 1 and 2.
-  opts_->filter = ("i64"_ == int64_t(1) and "u8"_ == uint8_t(2)).Copy();
+  SetFilter(and_(equal(field_ref("i64"), literal<int64_t>(1)),
+                 equal(field_ref("u8"), literal<uint8_t>(2))));
   CountRowsAndBatchesInScan(fragment, 0, 0);
 
-  opts_->filter = ("i64"_ == int64_t(2) or "i64"_ == int64_t(4)).Copy();
+  SetFilter(or_(equal(field_ref("i64"), literal<int64_t>(2)),
+                equal(field_ref("i64"), literal<int64_t>(4))));
   CountRowsAndBatchesInScan(fragment, 2 + 4, 2);
 
-  opts_->filter = ("i64"_ < int64_t(6)).Copy();
+  SetFilter(less(field_ref("i64"), literal<int64_t>(6)));
   CountRowsAndBatchesInScan(fragment, 5 * (5 + 1) / 2, 5);
 
-  opts_->filter = ("i64"_ >= int64_t(6)).Copy();
+  SetFilter(greater_equal(field_ref("i64"), literal<int64_t>(6)));
   CountRowsAndBatchesInScan(fragment, kTotalNumRows - (5 * (5 + 1) / 2),
                             kNumRowGroups - 5);
 }
@@ -443,40 +479,49 @@ TEST_F(TestParquetFileFormat, PredicatePushdownRowGroupFragments) {
   auto reader = ArithmeticDatasetFixture::GetRecordBatchReader(kNumRowGroups);
   auto source = GetFileSource(reader.get());
 
-  opts_ = ScanOptions::Make(reader->schema());
+  SetSchema(reader->schema()->fields());
   ASSERT_OK_AND_ASSIGN(auto fragment, format_->MakeFragment(*source));
 
   auto all_row_groups = internal::Iota(static_cast<int>(kNumRowGroups));
-  CountRowGroupsInFragment(fragment, all_row_groups, *scalar(true));
-  CountRowGroupsInFragment(fragment, all_row_groups, "not here"_ == 0);
+  CountRowGroupsInFragment(fragment, all_row_groups, literal(true));
+
+  // FIXME this is only meaningful if "not here" is a virtual column
+  // CountRowGroupsInFragment(fragment, all_row_groups, "not here"_ == 0);
 
   for (int i = 0; i < kNumRowGroups; ++i) {
-    CountRowGroupsInFragment(fragment, {i}, "i64"_ == int64_t(i + 1));
+    CountRowGroupsInFragment(fragment, {i}, equal(field_ref("i64"), literal(i + 1)));
   }
 
   // Out of bound filters should skip all RowGroups.
-  CountRowGroupsInFragment(fragment, {}, *scalar(false));
-  CountRowGroupsInFragment(fragment, {}, "i64"_ == int64_t(kNumRowGroups + 1));
-  CountRowGroupsInFragment(fragment, {}, "i64"_ == int64_t(-1));
+  CountRowGroupsInFragment(fragment, {}, literal(false));
+  CountRowGroupsInFragment(fragment, {},
+                           equal(field_ref("i64"), literal(kNumRowGroups + 1)));
+  CountRowGroupsInFragment(fragment, {}, equal(field_ref("i64"), literal(-1)));
 
   // No rows match 1 and 2.
-  CountRowGroupsInFragment(fragment, {}, "i64"_ == int64_t(1) and "u8"_ == uint8_t(2));
-  CountRowGroupsInFragment(fragment, {}, "i64"_ == int64_t(2) and "i64"_ == int64_t(4));
+  CountRowGroupsInFragment(
+      fragment, {},
+      and_(equal(field_ref("i64"), literal(1)), equal(field_ref("u8"), literal(2))));
+  CountRowGroupsInFragment(
+      fragment, {},
+      and_(equal(field_ref("i64"), literal(2)), equal(field_ref("i64"), literal(4))));
 
-  CountRowGroupsInFragment(fragment, {1, 3},
-                           "i64"_ == int64_t(2) or "i64"_ == int64_t(4));
+  CountRowGroupsInFragment(
+      fragment, {1, 3},
+      or_(equal(field_ref("i64"), literal(2)), equal(field_ref("i64"), literal(4))));
 
   // TODO(bkietz): better Assume support for InExpression
   // auto set = ArrayFromJSON(int64(), "[2, 4]");
-  // CountRowGroupsInFragment(fragment, {1, 3}, "i64"_.In(set));
+  // CountRowGroupsInFragment(fragment, {1, 3}, field_ref("i64").In(set));
 
-  CountRowGroupsInFragment(fragment, {0, 1, 2, 3, 4}, "i64"_ < int64_t(6));
+  CountRowGroupsInFragment(fragment, {0, 1, 2, 3, 4}, less(field_ref("i64"), literal(6)));
 
   CountRowGroupsInFragment(fragment, internal::Iota(5, static_cast<int>(kNumRowGroups)),
-                           "i64"_ >= int64_t(6));
+                           greater_equal(field_ref("i64"), literal(6)));
 
   CountRowGroupsInFragment(fragment, {5, 6},
-                           "i64"_ >= int64_t(6) and "i64"_ < int64_t(8));
+                           and_(greater_equal(field_ref("i64"), literal(6)),
+                                less(field_ref("i64"), literal(8))));
 }
 
 TEST_F(TestParquetFileFormat, PredicatePushdownRowGroupFragmentsUsingStringColumn) {
@@ -490,10 +535,10 @@ TEST_F(TestParquetFileFormat, PredicatePushdownRowGroupFragmentsUsingStringColum
   TableBatchReader reader(*table);
   auto source = GetFileSource(&reader);
 
-  opts_ = ScanOptions::Make(reader.schema());
+  SetSchema(reader.schema()->fields());
   ASSERT_OK_AND_ASSIGN(auto fragment, format_->MakeFragment(*source));
 
-  CountRowGroupsInFragment(fragment, {0, 3}, "x"_ == "a");
+  CountRowGroupsInFragment(fragment, {0, 3}, equal(field_ref("x"), literal("a")));
 }
 
 TEST_F(TestParquetFileFormat, ExplicitRowGroupSelection) {
@@ -503,60 +548,63 @@ TEST_F(TestParquetFileFormat, ExplicitRowGroupSelection) {
   auto reader = ArithmeticDatasetFixture::GetRecordBatchReader(kNumRowGroups);
   auto source = GetFileSource(reader.get());
 
-  opts_ = ScanOptions::Make(reader->schema());
+  SetSchema(reader->schema()->fields());
+  SetFilter(literal(true));
 
   auto row_groups_fragment = [&](std::vector<int> row_groups) {
-    std::shared_ptr<Schema> physical_schema = nullptr;
     EXPECT_OK_AND_ASSIGN(auto fragment,
-                         format_->MakeFragment(*source, scalar(true),
-                                               RowGroupInfo::FromIdentifiers(row_groups),
-                                               physical_schema));
-    return internal::checked_pointer_cast<ParquetFileFragment>(fragment);
+                         format_->MakeFragment(*source, literal(true),
+                                               /*physical_schema=*/nullptr, row_groups));
+    return fragment;
   };
 
-  EXPECT_OK_AND_ASSIGN(auto all_row_groups_fragment,
-                       format_->MakeFragment(*source, scalar(true)));
+  // select all row groups
+  EXPECT_OK_AND_ASSIGN(
+      auto all_row_groups_fragment,
+      format_->MakeFragment(*source, literal(true))
+          .Map([](std::shared_ptr<FileFragment> f) {
+            return internal::checked_pointer_cast<ParquetFileFragment>(f);
+          }));
 
-  // null selection is identical to selecting all row groups
-  EXPECT_EQ(internal::checked_pointer_cast<ParquetFileFragment>(all_row_groups_fragment)
-                ->row_groups(),
-            nullptr);
+  EXPECT_EQ(all_row_groups_fragment->row_groups(), std::vector<int>{});
+
+  ARROW_EXPECT_OK(all_row_groups_fragment->EnsureCompleteMetadata());
   CountRowsAndBatchesInScan(all_row_groups_fragment, kTotalNumRows, kNumRowGroups);
 
   // individual selection selects a single row group
   for (int i = 0; i < kNumRowGroups; ++i) {
     CountRowsAndBatchesInScan(row_groups_fragment({i}), i + 1, 1);
-    EXPECT_EQ(*row_groups_fragment({i})->row_groups(),
-              RowGroupInfo::FromIdentifiers({i}));
+    EXPECT_EQ(row_groups_fragment({i})->row_groups(), std::vector<int>{i});
   }
 
   for (int i = 0; i < kNumRowGroups; ++i) {
     // conflicting selection/filter
-    opts_->filter = ("i64"_ == int64_t(i)).Copy();
+    SetFilter(equal(field_ref("i64"), literal(i)));
     CountRowsAndBatchesInScan(row_groups_fragment({i}), 0, 0);
   }
 
   for (int i = 0; i < kNumRowGroups; ++i) {
     // identical selection/filter
-    opts_->filter = ("i64"_ == int64_t(i + 1)).Copy();
+    SetFilter(equal(field_ref("i64"), literal(i + 1)));
     CountRowsAndBatchesInScan(row_groups_fragment({i}), i + 1, 1);
   }
 
-  opts_->filter = ("i64"_ > int64_t(3)).Copy();
+  SetFilter(greater(field_ref("i64"), literal(3)));
   CountRowsAndBatchesInScan(row_groups_fragment({2, 3, 4, 5}), 4 + 5 + 6, 3);
 
   EXPECT_RAISES_WITH_MESSAGE_THAT(
       IndexError,
       testing::HasSubstr("only has " + std::to_string(kNumRowGroups) + " row groups"),
-      row_groups_fragment({kNumRowGroups + 1})->Scan(opts_, ctx_));
+      row_groups_fragment({kNumRowGroups + 1})->Scan(opts_));
 }
 
 TEST_F(TestParquetFileFormat, WriteRecordBatchReader) {
-  std::shared_ptr<RecordBatchReader> reader = GetRecordBatchReader();
+  std::shared_ptr<RecordBatchReader> reader =
+      GetRecordBatchReader(schema({field("f64", float64())}));
   auto source = GetFileSource(reader.get());
-  reader = GetRecordBatchReader();
+  reader = GetRecordBatchReader(schema({field("f64", float64())}));
 
-  opts_ = ScanOptions::Make(reader->schema());
+  SetSchema(reader->schema()->fields());
 
   EXPECT_OK_AND_ASSIGN(auto sink, GetFileSink());
 
@@ -577,7 +625,7 @@ TEST_F(TestParquetFileFormat, WriteRecordBatchReaderCustomOptions) {
   std::shared_ptr<RecordBatchReader> reader =
       GetRecordBatchReader(schema({field("ts", timestamp(coerce_timestamps_from))}));
 
-  opts_ = ScanOptions::Make(reader->schema());
+  SetSchema(reader->schema()->fields());
 
   EXPECT_OK_AND_ASSIGN(auto sink, GetFileSink());
 
@@ -590,6 +638,7 @@ TEST_F(TestParquetFileFormat, WriteRecordBatchReaderCustomOptions) {
 
   options->arrow_writer_properties = parquet::ArrowWriterProperties::Builder()
                                          .coerce_timestamps(coerce_timestamps_to)
+                                         ->allow_truncated_timestamps()
                                          ->build();
 
   EXPECT_OK_AND_ASSIGN(auto writer, format_->MakeWriter(sink, reader->schema(), options));

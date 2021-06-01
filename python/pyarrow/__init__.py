@@ -64,9 +64,10 @@ import pyarrow.lib as _lib
 if _gc_enabled:
     _gc.enable()
 
-from pyarrow.lib import (BuildInfo, VersionInfo,
+from pyarrow.lib import (BuildInfo, RuntimeInfo, VersionInfo,
                          cpp_build_info, cpp_version, cpp_version_info,
-                         cpu_count, set_cpu_count)
+                         runtime_info, cpu_count, set_cpu_count,
+                         enable_signal_handlers)
 
 
 def show_versions():
@@ -95,15 +96,17 @@ from pyarrow.lib import (null, bool_,
                          float16, float32, float64,
                          binary, string, utf8,
                          large_binary, large_string, large_utf8,
-                         decimal128,
-                         list_, large_list, map_, struct, union, dictionary,
+                         decimal128, decimal256,
+                         list_, large_list, map_, struct,
+                         union, sparse_union, dense_union,
+                         dictionary,
                          field,
                          type_for_alias,
                          DataType, DictionaryType, StructType,
                          ListType, LargeListType, MapType, FixedSizeListType,
-                         UnionType,
+                         UnionType, SparseUnionType, DenseUnionType,
                          TimestampType, Time32Type, Time64Type, DurationType,
-                         FixedSizeBinaryType, Decimal128Type,
+                         FixedSizeBinaryType, Decimal128Type, Decimal256Type,
                          BaseExtensionType, ExtensionType,
                          PyExtensionType, UnknownExtensionType,
                          register_extension_type, unregister_extension_type,
@@ -133,13 +136,13 @@ from pyarrow.lib import (null, bool_,
                          DictionaryArray,
                          Date32Array, Date64Array, TimestampArray,
                          Time32Array, Time64Array, DurationArray,
-                         Decimal128Array, StructArray, ExtensionArray,
+                         Decimal128Array, Decimal256Array, StructArray, ExtensionArray,
                          scalar, NA, _NULL as NULL, Scalar,
                          NullScalar, BooleanScalar,
                          Int8Scalar, Int16Scalar, Int32Scalar, Int64Scalar,
                          UInt8Scalar, UInt16Scalar, UInt32Scalar, UInt64Scalar,
                          HalfFloatScalar, FloatScalar, DoubleScalar,
-                         Decimal128Scalar,
+                         Decimal128Scalar, Decimal256Scalar,
                          ListScalar, LargeListScalar, FixedSizeListScalar,
                          Date32Scalar, Date64Scalar,
                          Time32Scalar, Time64Scalar,
@@ -155,9 +158,10 @@ from pyarrow.lib import (Buffer, ResizableBuffer, foreign_buffer, py_buffer,
 
 from pyarrow.lib import (MemoryPool, LoggingMemoryPool, ProxyMemoryPool,
                          total_allocated_bytes, set_memory_pool,
-                         default_memory_pool, logging_memory_pool,
-                         proxy_memory_pool, log_memory_allocations,
-                         jemalloc_set_decay_ms)
+                         default_memory_pool, system_memory_pool,
+                         jemalloc_memory_pool, mimalloc_memory_pool,
+                         logging_memory_pool, proxy_memory_pool,
+                         log_memory_allocations, jemalloc_set_decay_ms)
 
 # I/O
 from pyarrow.lib import (HdfsFile, NativeFile, PythonFile,
@@ -174,8 +178,11 @@ from pyarrow.lib import (ChunkedArray, RecordBatch, Table, table,
                          concat_arrays, concat_tables)
 
 # Exceptions
-from pyarrow.lib import (ArrowException,
+from pyarrow.lib import (ArrowCancelled,
+                         ArrowCapacityError,
+                         ArrowException,
                          ArrowKeyError,
+                         ArrowIndexError,
                          ArrowInvalid,
                          ArrowIOError,
                          ArrowMemoryError,
@@ -242,11 +249,11 @@ if _sys.version_info >= (3, 7):
         if name in _deprecated:
             obj, new_name = _deprecated[name]
             _warnings.warn(_msg.format(name, new_name),
-                           DeprecationWarning, stacklevel=2)
+                           FutureWarning, stacklevel=2)
             return obj
         elif name in _serialization_deprecatd:
             _warnings.warn(_serialization_msg.format(name),
-                           DeprecationWarning, stacklevel=2)
+                           FutureWarning, stacklevel=2)
             return _serialization_deprecatd[name]
 
         raise AttributeError(
@@ -344,6 +351,7 @@ LargeStringValue = _deprecate_scalar("LargeString", LargeStringScalar)
 FixedSizeBinaryValue = _deprecate_scalar("FixedSizeBinary",
                                          FixedSizeBinaryScalar)
 Decimal128Value = _deprecate_scalar("Decimal128", Decimal128Scalar)
+Decimal256Value = _deprecate_scalar("Decimal256", Decimal256Scalar)
 UnionValue = _deprecate_scalar("Union", UnionScalar)
 StructValue = _deprecate_scalar("Struct", StructScalar)
 DictionaryValue = _deprecate_scalar("Dictionary", DictionaryScalar)
@@ -445,7 +453,7 @@ def create_library_symlinks():
         except PermissionError:
             print("Tried creating symlink {}. If you need to link to "
                   "bundled shared libraries, run "
-                  "pyarrow._setup_bundled_symlinks() as root")
+                  "pyarrow.create_library_symlinks() as root")
 
 
 def get_library_dirs():

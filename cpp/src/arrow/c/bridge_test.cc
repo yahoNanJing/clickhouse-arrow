@@ -33,6 +33,7 @@
 #include "arrow/memory_pool.h"
 #include "arrow/testing/gtest_util.h"
 #include "arrow/testing/util.h"
+#include "arrow/util/endian.h"
 #include "arrow/util/key_value_metadata.h"
 #include "arrow/util/logging.h"
 #include "arrow/util/macros.h"
@@ -281,6 +282,7 @@ TEST_F(TestSchemaExport, Primitive) {
   TestPrimitive(large_utf8(), "U");
 
   TestPrimitive(decimal(16, 4), "d:16,4");
+  TestPrimitive(decimal256(16, 4), "d:16,4,256");
 }
 
 TEST_F(TestSchemaExport, Temporal) {
@@ -740,6 +742,7 @@ TEST_F(TestArrayExport, Primitive) {
   TestPrimitive(large_utf8(), R"(["foo", "bar", null])");
 
   TestPrimitive(decimal(16, 4), R"(["1234.5670", null])");
+  TestPrimitive(decimal256(16, 4), R"(["1234.5670", null])");
 }
 
 TEST_F(TestArrayExport, PrimitiveSliced) {
@@ -1186,6 +1189,13 @@ TEST_F(TestSchemaImport, Primitive) {
   CheckImport(field("", float32()));
   FillPrimitive("g");
   CheckImport(field("", float64()));
+
+  FillPrimitive("d:16,4");
+  CheckImport(field("", decimal128(16, 4)));
+  FillPrimitive("d:16,4,128");
+  CheckImport(field("", decimal128(16, 4)));
+  FillPrimitive("d:16,4,256");
+  CheckImport(field("", decimal256(16, 4)));
 }
 
 TEST_F(TestSchemaImport, Temporal) {
@@ -2373,6 +2383,8 @@ TEST_F(TestSchemaRoundtrip, Primitive) {
   TestWithTypeFactory(float16);
 
   TestWithTypeFactory(std::bind(decimal, 19, 4));
+  TestWithTypeFactory(std::bind(decimal128, 19, 4));
+  TestWithTypeFactory(std::bind(decimal256, 19, 4));
   TestWithTypeFactory(std::bind(fixed_size_binary, 3));
   TestWithTypeFactory(binary);
   TestWithTypeFactory(large_utf8);
@@ -2430,7 +2442,7 @@ TEST_F(TestSchemaRoundtrip, Map) {
 
 TEST_F(TestSchemaRoundtrip, Schema) {
   auto f1 = field("f1", utf8(), /*nullable=*/false);
-  auto f2 = field("f2", list(decimal(19, 4)));
+  auto f2 = field("f2", list(decimal256(19, 4)));
   auto md1 = key_value_metadata(kMetadataKeys1, kMetadataValues1);
   auto md2 = key_value_metadata(kMetadataKeys2, kMetadataValues2);
 
@@ -2574,8 +2586,13 @@ TEST_F(TestArrayRoundtrip, Primitive) {
   TestWithJSON(int32(), "[]");
   TestWithJSON(int32(), "[4, 5, null]");
 
+  TestWithJSON(decimal128(16, 4), R"(["0.4759", "1234.5670", null])");
+  TestWithJSON(decimal256(16, 4), R"(["0.4759", "1234.5670", null])");
+
   TestWithJSONSliced(int32(), "[4, 5]");
   TestWithJSONSliced(int32(), "[4, 5, 6, null]");
+  TestWithJSONSliced(decimal128(16, 4), R"(["0.4759", "1234.5670", null])");
+  TestWithJSONSliced(decimal256(16, 4), R"(["0.4759", "1234.5670", null])");
 }
 
 TEST_F(TestArrayRoundtrip, UnknownNullCount) {

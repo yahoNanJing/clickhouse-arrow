@@ -21,13 +21,13 @@
 #' This function enables you to read Parquet files into R.
 #'
 #' @inheritParams read_feather
-#' @param props [ParquetReaderProperties]
+#' @param props [ParquetArrowReaderProperties]
 #' @param ... Additional arguments passed to `ParquetFileReader$create()`
 #'
 #' @return A [arrow::Table][Table], or a `data.frame` if `as_data_frame` is
 #' `TRUE` (the default).
 #' @examples
-#' \donttest{
+#' \dontrun{
 #' tf <- tempfile()
 #' on.exit(unlink(tf))
 #' write_parquet(mtcars, tf)
@@ -38,7 +38,7 @@
 read_parquet <- function(file,
                          col_select = NULL,
                          as_data_frame = TRUE,
-                         props = ParquetReaderProperties$create(),
+                         props = ParquetArrowReaderProperties$create(),
                          ...) {
   if (is.string(file)) {
     file <- make_readable_file(file)
@@ -52,10 +52,16 @@ read_parquet <- function(file,
     schema <- reader$GetSchema()
     names <- names(schema)
     indices <- match(vars_select(names, !!col_select), names) - 1L
-    tab <- reader$ReadTable(indices)
+    tab <- tryCatch(
+      reader$ReadTable(indices),
+      error = read_compressed_error
+    )
   } else {
     # read all columns
-    tab <- reader$ReadTable()
+    tab <- tryCatch(
+      reader$ReadTable(),
+      error = read_compressed_error
+    )
   }
 
   if (as_data_frame) {
@@ -93,6 +99,12 @@ read_parquet <- function(file,
 #' @param allow_truncated_timestamps Allow loss of data when coercing timestamps to a
 #'    particular resolution. E.g. if microsecond or nanosecond data is lost when coercing
 #'    to "ms", do not raise an exception
+#' @param properties A `ParquetWriterProperties` object, used instead of the options
+#'    enumerated in this function's signature. Providing `properties` as an argument
+#'    is deprecated; if you need to assemble `ParquetWriterProperties` outside
+#'    of `write_parquet()`, use `ParquetFileWriter` instead.
+#' @param arrow_properties A `ParquetArrowWriterProperties` object. Like
+#'    `properties`, this argument is deprecated.
 #'
 #' @details The parameters `compression`, `compression_level`, `use_dictionary` and
 #'   `write_statistics` support various patterns:
@@ -116,7 +128,7 @@ read_parquet <- function(file,
 #' @return the input `x` invisibly.
 #'
 #' @examples
-#' \donttest{
+#' \dontrun{
 #' tf1 <- tempfile(fileext = ".parquet")
 #' write_parquet(data.frame(x = 1:5), tf1)
 #'
@@ -140,9 +152,11 @@ write_parquet <- function(x,
                           # arrow writer properties
                           use_deprecated_int96_timestamps = FALSE,
                           coerce_timestamps = NULL,
-                          allow_truncated_timestamps = FALSE) {
+                          allow_truncated_timestamps = FALSE,
+                          properties = NULL,
+                          arrow_properties = NULL) {
   x_out <- x
-  if (is.data.frame(x)) {
+  if (!inherits(x, "Table")) {
     x <- Table$create(x)
   }
 
@@ -151,10 +165,18 @@ write_parquet <- function(x,
     on.exit(sink$close())
   }
 
+  # Deprecation warnings
+  if (!is.null(properties)) {
+    warning("Providing 'properties' is deprecated. If you need to assemble properties outside this function, use ParquetFileWriter instead.")
+  }
+  if (!is.null(arrow_properties)) {
+    warning("Providing 'arrow_properties' is deprecated. If you need to assemble arrow_properties outside this function, use ParquetFileWriter instead.")
+  }
+
   writer <- ParquetFileWriter$create(
     x$schema,
     sink,
-    properties = ParquetWriterProperties$create(
+    properties = properties %||% ParquetWriterProperties$create(
       x,
       version = version,
       compression = compression,
@@ -163,7 +185,7 @@ write_parquet <- function(x,
       write_statistics = write_statistics,
       data_page_size = data_page_size
     ),
-    arrow_properties = ParquetArrowWriterProperties$create(
+    arrow_properties = arrow_properties %||% ParquetArrowWriterProperties$create(
       use_deprecated_int96_timestamps = use_deprecated_int96_timestamps,
       coerce_timestamps = coerce_timestamps,
       allow_truncated_timestamps = allow_truncated_timestamps
@@ -196,13 +218,10 @@ ParquetArrowWriterProperties$create <- function(use_deprecated_int96_timestamps 
       c("ms" = TimeUnit$MILLI, "us" = TimeUnit$MICRO)
     )
   }
-  shared_ptr(
-    ParquetArrowWriterProperties,
-    parquet___ArrowWriterProperties___create(
-      use_deprecated_int96_timestamps = isTRUE(use_deprecated_int96_timestamps),
-      timestamp_unit = timestamp_unit,
-      allow_truncated_timestamps = isTRUE(allow_truncated_timestamps)
-    )
+  parquet___ArrowWriterProperties___create(
+    use_deprecated_int96_timestamps = isTRUE(use_deprecated_int96_timestamps),
+    timestamp_unit = timestamp_unit,
+    allow_truncated_timestamps = isTRUE(allow_truncated_timestamps)
   )
 }
 
@@ -262,6 +281,7 @@ make_valid_version <- function(version, valid_versions = valid_parquet_version) 
 #' "snappy" for the `compression` argument.
 #'
 #' @seealso [write_parquet]
+#' @seealso [Schema] for information about schemas and metadata handling.
 #'
 #' @export
 ParquetWriterProperties <- R6Class("ParquetWriterProperties", inherit = ArrowObject)
@@ -332,10 +352,7 @@ ParquetWriterProperties$create <- function(table,
                                            write_statistics = NULL,
                                            data_page_size = NULL,
                                            ...) {
-  builder <- shared_ptr(
-    ParquetWriterPropertiesBuilder,
-    parquet___WriterProperties___Builder__create()
-  )
+  builder <- parquet___WriterProperties___Builder__create()
   if (!is.null(version)) {
     builder$set_version(version)
   }
@@ -354,7 +371,7 @@ ParquetWriterProperties$create <- function(table,
   if (!is.null(data_page_size)) {
     builder$set_data_page_size(data_page_size)
   }
-  shared_ptr(ParquetWriterProperties, parquet___WriterProperties___Builder__build(builder))
+  parquet___WriterProperties___Builder__build(builder)
 }
 
 #' @title ParquetFileWriter class
@@ -396,10 +413,7 @@ ParquetFileWriter$create <- function(schema,
                                      properties = ParquetWriterProperties$create(),
                                      arrow_properties = ParquetArrowWriterProperties$create()) {
   assert_is(sink, "OutputStream")
-  shared_ptr(
-    ParquetFileWriter,
-    parquet___arrow___ParquetFileWriter__Open(schema, sink, properties, arrow_properties)
-  )
+  parquet___arrow___ParquetFileWriter__Open(schema, sink, properties, arrow_properties)
 }
 
 
@@ -418,7 +432,7 @@ ParquetFileWriter$create <- function(schema,
 #'
 #' - `file` A character file name, raw vector, or Arrow file connection object
 #'    (e.g. `RandomAccessFile`).
-#' - `props` Optional [ParquetReaderProperties]
+#' - `props` Optional [ParquetArrowReaderProperties]
 #' - `mmap` Logical: whether to memory-map the file (default `TRUE`)
 #' - `...` Additional arguments, currently ignored
 #'
@@ -441,7 +455,7 @@ ParquetFileWriter$create <- function(schema,
 #'
 #' @export
 #' @examples
-#' \donttest{
+#' \dontrun{
 #' f <- system.file("v0.7.1.parquet", package="arrow")
 #' pq <- ParquetFileReader$create(f)
 #' pq$GetSchema()
@@ -468,53 +482,53 @@ ParquetFileReader <- R6Class("ParquetFileReader",
   public = list(
     ReadTable = function(column_indices = NULL) {
       if (is.null(column_indices)) {
-        shared_ptr(Table, parquet___arrow___FileReader__ReadTable1(self))
+        parquet___arrow___FileReader__ReadTable1(self)
       } else {
         column_indices <- vec_cast(column_indices, integer())
-        shared_ptr(Table, parquet___arrow___FileReader__ReadTable2(self, column_indices))
+        parquet___arrow___FileReader__ReadTable2(self, column_indices)
       }
     },
     ReadRowGroup = function(i, column_indices = NULL) {
       i <- vec_cast(i, integer())
       if (is.null(column_indices)) {
-        shared_ptr(Table, parquet___arrow___FileReader__ReadRowGroup1(self, i))
+        parquet___arrow___FileReader__ReadRowGroup1(self, i)
       } else {
         column_indices <- vec_cast(column_indices, integer())
-        shared_ptr(Table, parquet___arrow___FileReader__ReadRowGroup2(self, i, column_indices))
+        parquet___arrow___FileReader__ReadRowGroup2(self, i, column_indices)
       }
     },
     ReadRowGroups = function(row_groups, column_indices = NULL) {
       row_groups <- vec_cast(row_groups, integer())
       if (is.null(column_indices)) {
-        shared_ptr(Table, parquet___arrow___FileReader__ReadRowGroups1(self, row_groups))
+        parquet___arrow___FileReader__ReadRowGroups1(self, row_groups)
       } else {
         column_indices <- vec_cast(column_indices, integer())
-        shared_ptr(Table, parquet___arrow___FileReader__ReadRowGroups2(self, row_groups, column_indices))
+        parquet___arrow___FileReader__ReadRowGroups2(self, row_groups, column_indices)
       }
     },
     ReadColumn = function(i) {
       i <- vec_cast(i, integer())
-      shared_ptr(ChunkedArray, parquet___arrow___FileReader__ReadColumn(self, i))
+      parquet___arrow___FileReader__ReadColumn(self, i)
     },
     GetSchema = function() {
-      shared_ptr(Schema, parquet___arrow___FileReader__GetSchema(self))
+      parquet___arrow___FileReader__GetSchema(self)
     }
   )
 )
 
 ParquetFileReader$create <- function(file,
-                                     props = ParquetReaderProperties$create(),
+                                     props = ParquetArrowReaderProperties$create(),
                                      mmap = TRUE,
                                      ...) {
   file <- make_readable_file(file, mmap)
-  assert_is(props, "ParquetReaderProperties")
+  assert_is(props, "ParquetArrowReaderProperties")
 
-  shared_ptr(ParquetFileReader, parquet___arrow___FileReader__OpenFile(file, props))
+  parquet___arrow___FileReader__OpenFile(file, props)
 }
 
-#' @title ParquetReaderProperties class
-#' @rdname ParquetReaderProperties
-#' @name ParquetReaderProperties
+#' @title ParquetArrowReaderProperties class
+#' @rdname ParquetArrowReaderProperties
+#' @name ParquetArrowReaderProperties
 #' @docType class
 #' @usage NULL
 #' @format NULL
@@ -523,7 +537,7 @@ ParquetFileReader$create <- function(file,
 #'
 #' @section Factory:
 #'
-#' The `ParquetReaderProperties$create()` factory method instantiates the object
+#' The `ParquetArrowReaderProperties$create()` factory method instantiates the object
 #' and takes the following arguments:
 #'
 #' - `use_threads` Logical: whether to use multithreading (default `TRUE`)
@@ -535,7 +549,7 @@ ParquetFileReader$create <- function(file,
 #' - `$use_threads(use_threads)`
 #'
 #' @export
-ParquetReaderProperties <- R6Class("ParquetReaderProperties",
+ParquetArrowReaderProperties <- R6Class("ParquetArrowReaderProperties",
   inherit = ArrowObject,
   public = list(
     read_dictionary = function(column_index) {
@@ -556,9 +570,6 @@ ParquetReaderProperties <- R6Class("ParquetReaderProperties",
   )
 )
 
-ParquetReaderProperties$create <- function(use_threads = option_use_threads()) {
-  shared_ptr(
-    ParquetReaderProperties,
-    parquet___arrow___ArrowReaderProperties__Make(isTRUE(use_threads))
-  )
+ParquetArrowReaderProperties$create <- function(use_threads = option_use_threads()) {
+  parquet___arrow___ArrowReaderProperties__Make(isTRUE(use_threads))
 }

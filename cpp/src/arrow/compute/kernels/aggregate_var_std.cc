@@ -15,70 +15,129 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#include "arrow/compute/kernels/aggregate_basic_internal.h"
+#include <cmath>
+
+#include "arrow/compute/api_aggregate.h"
+#include "arrow/compute/kernels/aggregate_internal.h"
+#include "arrow/compute/kernels/common.h"
+#include "arrow/util/bit_run_reader.h"
+#include "arrow/util/int128_internal.h"
 
 namespace arrow {
 namespace compute {
-namespace aggregate {
+namespace internal {
 
 namespace {
+
+using arrow::internal::int128_t;
+using arrow::internal::VisitSetBitRunsVoid;
 
 template <typename ArrowType>
 struct VarStdState {
   using ArrayType = typename TypeTraits<ArrowType>::ArrayType;
-  using c_type = typename ArrowType::c_type;
+  using CType = typename ArrowType::c_type;
   using ThisType = VarStdState<ArrowType>;
 
-  // Calculate `m2` (sum((X-mean)^2)) of one chunk with `two pass algorithm`
+  // float/double/int64: calculate `m2` (sum((X-mean)^2)) with `two pass algorithm`
   // https://en.wikipedia.org/wiki/Algorithms_for_calculating_variance#Two-pass_algorithm
-  // Always use `double` to calculate variance for any array type
-  void Consume(const ArrayType& array) {
+  template <typename T = ArrowType>
+  enable_if_t<is_floating_type<T>::value || (sizeof(CType) > 4)> Consume(
+      const ArrayType& array) {
     int64_t count = array.length() - array.null_count();
     if (count == 0) {
       return;
     }
 
-    double sum = 0;
-    VisitArrayDataInline<ArrowType>(
-        *array.data(), [&sum](c_type value) { sum += static_cast<double>(value); },
-        []() {});
+    using SumType =
+        typename std::conditional<is_floating_type<T>::value, double, int128_t>::type;
+    SumType sum = arrow::compute::detail::SumArray<CType, SumType>(*array.data());
 
-    double mean = sum / count, m2 = 0;
-    VisitArrayDataInline<ArrowType>(
-        *array.data(),
-        [mean, &m2](c_type value) {
-          double v = static_cast<double>(value);
-          m2 += (v - mean) * (v - mean);
-        },
-        []() {});
+    const double mean = static_cast<double>(sum) / count;
+    const double m2 = arrow::compute::detail::SumArray<CType, double>(
+        *array.data(), [mean](CType value) {
+          const double v = static_cast<double>(value);
+          return (v - mean) * (v - mean);
+        });
 
     this->count = count;
-    this->sum = sum;
+    this->mean = mean;
     this->m2 = m2;
   }
 
-  // Combine `m2` from two chunks
-  // https://en.wikipedia.org/wiki/Algorithms_for_calculating_variance#Parallel_algorithm
+  // int32/16/8: textbook one pass algorithm with integer arithmetic
+  template <typename T = ArrowType>
+  enable_if_t<is_integer_type<T>::value && (sizeof(CType) <= 4)> Consume(
+      const ArrayType& array) {
+    // max number of elements that sum will not overflow int64 (2Gi int32 elements)
+    // for uint32:    0 <= sum < 2^63 (int64 >= 0)
+    // for int32: -2^62 <= sum < 2^62
+    constexpr int64_t max_length = 1ULL << (63 - sizeof(CType) * 8);
+
+    int64_t start_index = 0;
+    int64_t valid_count = array.length() - array.null_count();
+
+    while (valid_count > 0) {
+      // process in chunks that overflow will never happen
+      const auto slice = array.Slice(start_index, max_length);
+      const int64_t count = slice->length() - slice->null_count();
+      start_index += max_length;
+      valid_count -= count;
+
+      if (count > 0) {
+        int64_t sum = 0;
+        int128_t square_sum = 0;
+        const ArrayData& data = *slice->data();
+        const CType* values = data.GetValues<CType>(1);
+        VisitSetBitRunsVoid(data.buffers[0], data.offset, data.length,
+                            [&](int64_t pos, int64_t len) {
+                              for (int64_t i = 0; i < len; ++i) {
+                                const auto value = values[pos + i];
+                                sum += value;
+                                square_sum += static_cast<uint64_t>(value) * value;
+                              }
+                            });
+
+        const double mean = static_cast<double>(sum) / count;
+        // calculate m2 = square_sum - sum * sum / count
+        // decompose `sum * sum / count` into integers and fractions
+        const int128_t sum_square = static_cast<int128_t>(sum) * sum;
+        const int128_t integers = sum_square / count;
+        const double fractions = static_cast<double>(sum_square % count) / count;
+        const double m2 = static_cast<double>(square_sum - integers) - fractions;
+
+        // merge variance
+        ThisType state;
+        state.count = count;
+        state.mean = mean;
+        state.m2 = m2;
+        this->MergeFrom(state);
+      }
+    }
+  }
+
+  // Combine `m2` from two chunks (m2 = n*s2)
+  // https://www.emathzone.com/tutorials/basic-statistics/combined-variance.html
   void MergeFrom(const ThisType& state) {
     if (state.count == 0) {
       return;
     }
     if (this->count == 0) {
       this->count = state.count;
-      this->sum = state.sum;
+      this->mean = state.mean;
       this->m2 = state.m2;
       return;
     }
-    double delta = this->sum / this->count - state.sum / state.count;
-    this->m2 += state.m2 +
-                delta * delta * this->count * state.count / (this->count + state.count);
+    double mean = (this->mean * this->count + state.mean * state.count) /
+                  (this->count + state.count);
+    this->m2 += state.m2 + this->count * (this->mean - mean) * (this->mean - mean) +
+                state.count * (state.mean - mean) * (state.mean - mean);
     this->count += state.count;
-    this->sum += state.sum;
+    this->mean = mean;
   }
 
   int64_t count = 0;
-  double sum = 0;
-  double m2 = 0;  // sum((X-mean)^2)
+  double mean = 0;
+  double m2 = 0;  // m2 = count*s2 = sum((X-mean)^2)
 };
 
 enum class VarOrStd : bool { Var, Std };
@@ -179,24 +238,47 @@ void AddVarStdKernels(KernelInit init,
   }
 }
 
-}  // namespace
+const FunctionDoc stddev_doc{
+    "Calculate the standard deviation of a numeric array",
+    ("The number of degrees of freedom can be controlled using VarianceOptions.\n"
+     "By default (`ddof` = 0), the population standard deviation is calculated.\n"
+     "Nulls are ignored.  If there are not enough non-null values in the array\n"
+     "to satisfy `ddof`, null is returned."),
+    {"array"},
+    "VarianceOptions"};
+
+const FunctionDoc variance_doc{
+    "Calculate the variance of a numeric array",
+    ("The number of degrees of freedom can be controlled using VarianceOptions.\n"
+     "By default (`ddof` = 0), the population variance is calculated.\n"
+     "Nulls are ignored.  If there are not enough non-null values in the array\n"
+     "to satisfy `ddof`, null is returned."),
+    {"array"},
+    "VarianceOptions"};
 
 std::shared_ptr<ScalarAggregateFunction> AddStddevAggKernels() {
   static auto default_std_options = VarianceOptions::Defaults();
-  auto func = std::make_shared<ScalarAggregateFunction>("stddev", Arity::Unary(),
-                                                        &default_std_options);
-  AddVarStdKernels(StddevInit, internal::NumericTypes(), func.get());
+  auto func = std::make_shared<ScalarAggregateFunction>(
+      "stddev", Arity::Unary(), &stddev_doc, &default_std_options);
+  AddVarStdKernels(StddevInit, NumericTypes(), func.get());
   return func;
 }
 
 std::shared_ptr<ScalarAggregateFunction> AddVarianceAggKernels() {
   static auto default_var_options = VarianceOptions::Defaults();
-  auto func = std::make_shared<ScalarAggregateFunction>("variance", Arity::Unary(),
-                                                        &default_var_options);
-  AddVarStdKernels(VarianceInit, internal::NumericTypes(), func.get());
+  auto func = std::make_shared<ScalarAggregateFunction>(
+      "variance", Arity::Unary(), &variance_doc, &default_var_options);
+  AddVarStdKernels(VarianceInit, NumericTypes(), func.get());
   return func;
 }
 
-}  // namespace aggregate
+}  // namespace
+
+void RegisterScalarAggregateVariance(FunctionRegistry* registry) {
+  DCHECK_OK(registry->AddFunction(AddVarianceAggKernels()));
+  DCHECK_OK(registry->AddFunction(AddStddevAggKernels()));
+}
+
+}  // namespace internal
 }  // namespace compute
 }  // namespace arrow

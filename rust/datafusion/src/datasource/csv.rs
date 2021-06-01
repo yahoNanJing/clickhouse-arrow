@@ -25,7 +25,7 @@
 //! use datafusion::datasource::TableProvider;
 //! use datafusion::datasource::csv::{CsvFile, CsvReadOptions};
 //!
-//! let testdata = std::env::var("ARROW_TEST_DATA").expect("ARROW_TEST_DATA not defined");
+//! let testdata = arrow::util::test_util::arrow_test_data();
 //! let csvdata = CsvFile::try_new(
 //!     &format!("{}/csv/aggregate_test_100.csv", testdata),
 //!     CsvReadOptions::new().delimiter(b'|'),
@@ -34,11 +34,14 @@
 //! ```
 
 use arrow::datatypes::SchemaRef;
+use std::any::Any;
 use std::string::String;
 use std::sync::Arc;
 
+use crate::datasource::datasource::Statistics;
 use crate::datasource::TableProvider;
-use crate::error::{ExecutionError, Result};
+use crate::error::{DataFusionError, Result};
+use crate::logical_plan::Expr;
 use crate::physical_plan::csv::CsvExec;
 pub use crate::physical_plan::csv::CsvReadOptions;
 use crate::physical_plan::{common, ExecutionPlan};
@@ -51,6 +54,7 @@ pub struct CsvFile {
     has_header: bool,
     delimiter: u8,
     file_extension: String,
+    statistics: Statistics,
 }
 
 impl CsvFile {
@@ -62,7 +66,11 @@ impl CsvFile {
                 let mut filenames: Vec<String> = vec![];
                 common::build_file_list(path, &mut filenames, options.file_extension)?;
                 if filenames.is_empty() {
-                    return Err(ExecutionError::General("No files found".to_string()));
+                    return Err(DataFusionError::Plan(format!(
+                        "No files found at {path} with file extension {file_extension}",
+                        path = path,
+                        file_extension = options.file_extension
+                    )));
                 }
                 CsvExec::try_infer_schema(&filenames, &options)?
             }
@@ -74,11 +82,36 @@ impl CsvFile {
             has_header: options.has_header,
             delimiter: options.delimiter,
             file_extension: String::from(options.file_extension),
+            statistics: Statistics::default(),
         })
+    }
+
+    /// Get the path for the CSV file(s) represented by this CsvFile instance
+    pub fn path(&self) -> &str {
+        &self.path
+    }
+
+    /// Determine whether the CSV file(s) represented by this CsvFile instance have a header row
+    pub fn has_header(&self) -> bool {
+        self.has_header
+    }
+
+    /// Get the delimiter for the CSV file(s) represented by this CsvFile instance
+    pub fn delimiter(&self) -> u8 {
+        self.delimiter
+    }
+
+    /// Get the file extension for the CSV file(s) represented by this CsvFile instance
+    pub fn file_extension(&self) -> &str {
+        &self.file_extension
     }
 }
 
 impl TableProvider for CsvFile {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
     fn schema(&self) -> SchemaRef {
         self.schema.clone()
     }
@@ -87,6 +120,8 @@ impl TableProvider for CsvFile {
         &self,
         projection: &Option<Vec<usize>>,
         batch_size: usize,
+        _filters: &[Expr],
+        limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         Ok(Arc::new(CsvExec::try_new(
             &self.path,
@@ -96,7 +131,14 @@ impl TableProvider for CsvFile {
                 .delimiter(self.delimiter)
                 .file_extension(self.file_extension.as_str()),
             projection.clone(),
-            batch_size,
+            limit
+                .map(|l| std::cmp::min(l, batch_size))
+                .unwrap_or(batch_size),
+            limit,
         )?))
+    }
+
+    fn statistics(&self) -> Statistics {
+        self.statistics.clone()
     }
 }

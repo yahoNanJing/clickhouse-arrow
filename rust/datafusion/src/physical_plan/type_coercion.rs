@@ -19,7 +19,7 @@
 //!
 //! Coercion is performed automatically by DataFusion when the types
 //! of arguments passed to a function do not exacty match the types
-//! required by that function. In this case, DataFuson will attempt to
+//! required by that function. In this case, DataFusion will attempt to
 //! *coerce* the arguments to types accepted by the function by
 //! inserting CAST operations.
 //!
@@ -29,20 +29,20 @@
 //! i64. However, i64 -> i32 is never performed as there are i64
 //! values which can not be represented by i32 values.
 
-use std::sync::Arc;
+use std::{sync::Arc, vec};
 
-use arrow::datatypes::{DataType, Schema};
+use arrow::datatypes::{DataType, Schema, TimeUnit};
 
 use super::{functions::Signature, PhysicalExpr};
-use crate::error::{ExecutionError, Result};
-use crate::physical_plan::expressions::cast;
+use crate::error::{DataFusionError, Result};
+use crate::physical_plan::expressions::try_cast;
 
 /// Returns `expressions` coerced to types compatible with
 /// `signature`, if possible.
 ///
 /// See the module level documentation for more detail on coercion.
 pub fn coerce(
-    expressions: &Vec<Arc<dyn PhysicalExpr>>,
+    expressions: &[Arc<dyn PhysicalExpr>],
     schema: &Schema,
     signature: &Signature,
 ) -> Result<Vec<Arc<dyn PhysicalExpr>>> {
@@ -56,7 +56,7 @@ pub fn coerce(
     expressions
         .iter()
         .enumerate()
-        .map(|(i, expr)| cast(expr.clone(), &schema, new_types[i].clone()))
+        .map(|(i, expr)| try_cast(expr.clone(), &schema, new_types[i].clone()))
         .collect::<Result<Vec<_>>>()
 }
 
@@ -65,9 +65,35 @@ pub fn coerce(
 ///
 /// See the module level documentation for more detail on coercion.
 pub fn data_types(
-    current_types: &Vec<DataType>,
+    current_types: &[DataType],
     signature: &Signature,
 ) -> Result<Vec<DataType>> {
+    let valid_types = get_valid_types(signature, current_types)?;
+
+    if valid_types
+        .iter()
+        .any(|data_type| data_type == current_types)
+    {
+        return Ok(current_types.to_vec());
+    }
+
+    for valid_types in valid_types {
+        if let Some(types) = maybe_data_types(&valid_types, &current_types) {
+            return Ok(types);
+        }
+    }
+
+    // none possible -> Error
+    Err(DataFusionError::Plan(format!(
+        "Coercion from {:?} to the signature {:?} failed.",
+        current_types, signature
+    )))
+}
+
+fn get_valid_types(
+    signature: &Signature,
+    current_types: &[DataType],
+) -> Result<Vec<Vec<DataType>>> {
     let valid_types = match signature {
         Signature::Variadic(valid_types) => valid_types
             .iter()
@@ -87,7 +113,7 @@ pub fn data_types(
         Signature::Exact(valid_types) => vec![valid_types.clone()],
         Signature::Any(number) => {
             if current_types.len() != *number {
-                return Err(ExecutionError::General(format!(
+                return Err(DataFusionError::Plan(format!(
                     "The function expected {} arguments but received {}",
                     number,
                     current_types.len()
@@ -95,29 +121,22 @@ pub fn data_types(
             }
             vec![(0..*number).map(|i| current_types[i].clone()).collect()]
         }
+        Signature::OneOf(types) => {
+            let mut r = vec![];
+            for s in types {
+                r.extend(get_valid_types(s, current_types)?);
+            }
+            r
+        }
     };
 
-    if valid_types.contains(current_types) {
-        return Ok(current_types.clone());
-    }
-
-    for valid_types in valid_types {
-        if let Some(types) = maybe_data_types(&valid_types, &current_types) {
-            return Ok(types);
-        }
-    }
-
-    // none possible -> Error
-    Err(ExecutionError::General(format!(
-        "Coercion from {:?} to the signature {:?} failed.",
-        current_types, signature
-    )))
+    Ok(valid_types)
 }
 
 /// Try to coerce current_types into valid_types.
 fn maybe_data_types(
-    valid_types: &Vec<DataType>,
-    current_types: &Vec<DataType>,
+    valid_types: &[DataType],
+    current_types: &[DataType],
 ) -> Option<Vec<DataType>> {
     if valid_types.len() != current_types.len() {
         return None;
@@ -149,50 +168,34 @@ fn maybe_data_types(
 pub fn can_coerce_from(type_into: &DataType, type_from: &DataType) -> bool {
     use self::DataType::*;
     match type_into {
-        Int8 => match type_from {
-            Int8 => true,
-            _ => false,
-        },
-        Int16 => match type_from {
-            Int8 | Int16 | UInt8 => true,
-            _ => false,
-        },
-        Int32 => match type_from {
-            Int8 | Int16 | Int32 | UInt8 | UInt16 => true,
-            _ => false,
-        },
-        Int64 => match type_from {
-            Int8 | Int16 | Int32 | Int64 | UInt8 | UInt16 | UInt32 => true,
-            _ => false,
-        },
-        UInt8 => match type_from {
-            UInt8 => true,
-            _ => false,
-        },
-        UInt16 => match type_from {
-            UInt8 | UInt16 => true,
-            _ => false,
-        },
-        UInt32 => match type_from {
-            UInt8 | UInt16 | UInt32 => true,
-            _ => false,
-        },
-        UInt64 => match type_from {
-            UInt8 | UInt16 | UInt32 | UInt64 => true,
-            _ => false,
-        },
-        Float32 => match type_from {
-            Int8 | Int16 | Int32 | Int64 => true,
-            UInt8 | UInt16 | UInt32 | UInt64 => true,
-            Float32 => true,
-            _ => false,
-        },
-        Float64 => match type_from {
-            Int8 | Int16 | Int32 | Int64 => true,
-            UInt8 | UInt16 | UInt32 | UInt64 => true,
-            Float32 | Float64 => true,
-            _ => false,
-        },
+        Int8 => matches!(type_from, Int8),
+        Int16 => matches!(type_from, Int8 | Int16 | UInt8),
+        Int32 => matches!(type_from, Int8 | Int16 | Int32 | UInt8 | UInt16),
+        Int64 => matches!(
+            type_from,
+            Int8 | Int16 | Int32 | Int64 | UInt8 | UInt16 | UInt32
+        ),
+        UInt8 => matches!(type_from, UInt8),
+        UInt16 => matches!(type_from, UInt8 | UInt16),
+        UInt32 => matches!(type_from, UInt8 | UInt16 | UInt32),
+        UInt64 => matches!(type_from, UInt8 | UInt16 | UInt32 | UInt64),
+        Float32 => matches!(
+            type_from,
+            Int8 | Int16 | Int32 | Int64 | UInt8 | UInt16 | UInt32 | UInt64 | Float32
+        ),
+        Float64 => matches!(
+            type_from,
+            Int8 | Int16
+                | Int32
+                | Int64
+                | UInt8
+                | UInt16
+                | UInt32
+                | UInt64
+                | Float32
+                | Float64
+        ),
+        Timestamp(TimeUnit::Nanosecond, None) => matches!(type_from, Timestamp(_, None)),
         Utf8 => true,
         _ => false,
     }
@@ -205,7 +208,7 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Schema};
 
     #[test]
-    fn test_maybe_data_types() -> Result<()> {
+    fn test_maybe_data_types() {
         // this vec contains: arg1, arg2, expected result
         let cases = vec![
             // 2 entries, same values
@@ -239,7 +242,6 @@ mod tests {
         for case in cases {
             assert_eq!(maybe_data_types(&case.0, &case.1), case.2)
         }
-        Ok(())
     }
 
     #[test]
@@ -258,7 +260,7 @@ mod tests {
         let expressions = |t: Vec<DataType>, schema| -> Result<Vec<_>> {
             t.iter()
                 .enumerate()
-                .map(|(i, t)| cast(col(&format!("c{}", i)), &schema, t.clone()))
+                .map(|(i, t)| try_cast(col(&format!("c{}", i)), &schema, t.clone()))
                 .collect::<Result<Vec<_>>>()
         };
 
@@ -346,8 +348,8 @@ mod tests {
         ];
 
         for case in cases {
-            if let Ok(_) = coerce(&case.0, &case.1, &case.2) {
-                return Err(ExecutionError::General(format!(
+            if coerce(&case.0, &case.1, &case.2).is_ok() {
+                return Err(DataFusionError::Plan(format!(
                     "Error was expected in {:?}",
                     case
                 )));

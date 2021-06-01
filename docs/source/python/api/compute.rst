@@ -53,6 +53,8 @@ throws an ``ArrowInvalid`` exception when overflow is detected.
    multiply_checked
    subtract
    subtract_checked
+   power
+   power_checked
 
 Comparisons
 -----------
@@ -71,7 +73,7 @@ they return ``null``.
    not_equal
 
 Logical Functions
------------
+-----------------
 
 These functions normally emit a null when one of the inputs is null. However, Kleene
 logic variants are provided (suffixed ``_kleene``). See User Guide for details.
@@ -81,6 +83,8 @@ logic variants are provided (suffixed ``_kleene``). See User Guide for details.
 
    and_
    and_kleene
+   all
+   any
    invert
    or_
    or_kleene
@@ -153,6 +157,7 @@ Containment tests
    index_in
    is_in
    match_substring
+   match_substring_regex
 
 Conversions
 -----------

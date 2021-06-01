@@ -108,10 +108,7 @@ FileSelector <- R6Class("FileSelector",
 )
 
 FileSelector$create <- function(base_dir, allow_not_found = FALSE, recursive = FALSE) {
-  shared_ptr(
-    FileSelector,
-    fs___FileSelector__create(clean_path_rel(base_dir), allow_not_found, recursive)
-  )
+  fs___FileSelector__create(clean_path_rel(base_dir), allow_not_found, recursive)
 }
 
 #' @title FileSystem classes
@@ -203,31 +200,11 @@ FileSelector$create <- function(base_dir, allow_not_found = FALSE, recursive = F
 #' @export
 FileSystem <- R6Class("FileSystem", inherit = ArrowObject,
   public = list(
-    ..dispatch = function() {
-      type_name <- self$type_name
-      if (type_name == "local") {
-        shared_ptr(LocalFileSystem, self$pointer())
-      } else if (type_name == "s3") {
-        shared_ptr(S3FileSystem, self$pointer())
-      } else if (type_name == "subtree") {
-        shared_ptr(SubTreeFileSystem, self$pointer())
-      } else {
-        self
-      }
-    },
     GetFileInfo = function(x) {
       if (inherits(x, "FileSelector")) {
-        map(
-          fs___FileSystem__GetTargetInfos_FileSelector(self, x),
-          shared_ptr,
-          class = FileInfo
-        )
+        fs___FileSystem__GetTargetInfos_FileSelector(self, x)
       } else if (is.character(x)){
-        map(
-          fs___FileSystem__GetTargetInfos_Paths(self, clean_path_rel(x)),
-          shared_ptr,
-          class = FileInfo
-        )
+        fs___FileSystem__GetTargetInfos_Paths(self, clean_path_rel(x))
       } else {
         abort("incompatible type for FileSystem$GetFileInfo()")
       }
@@ -262,16 +239,16 @@ FileSystem <- R6Class("FileSystem", inherit = ArrowObject,
     },
 
     OpenInputStream = function(path) {
-      shared_ptr(InputStream, fs___FileSystem__OpenInputStream(self, clean_path_rel(path)))
+      fs___FileSystem__OpenInputStream(self, clean_path_rel(path))
     },
     OpenInputFile = function(path) {
-      shared_ptr(RandomAccessFile, fs___FileSystem__OpenInputFile(self, clean_path_rel(path)))
+      fs___FileSystem__OpenInputFile(self, clean_path_rel(path))
     },
     OpenOutputStream = function(path) {
-      shared_ptr(OutputStream, fs___FileSystem__OpenOutputStream(self, clean_path_rel(path)))
+      fs___FileSystem__OpenOutputStream(self, clean_path_rel(path))
     },
     OpenAppendStream = function(path) {
-      shared_ptr(OutputStream, fs___FileSystem__OpenAppendStream(self, clean_path_rel(path)))
+      fs___FileSystem__OpenAppendStream(self, clean_path_rel(path))
     },
 
     # Friendlier R user interface
@@ -293,32 +270,56 @@ FileSystem <- R6Class("FileSystem", inherit = ArrowObject,
 )
 FileSystem$from_uri <- function(uri) {
   assert_that(is.string(uri))
-  out <- fs___FileSystemFromUri(uri)
-  out$fs <- shared_ptr(FileSystem, out$fs)$..dispatch()
-  out
+  fs___FileSystemFromUri(uri)
 }
 
-get_path_and_filesystem <- function(x, filesystem = NULL) {
+get_paths_and_filesystem <- function(x, filesystem = NULL) {
   # Wrapper around FileSystem$from_uri that handles local paths
   # and an optional explicit filesystem
   if (inherits(x, "SubTreeFileSystem")) {
     return(list(fs = x$base_fs, path = x$base_path))
   }
-  assert_that(is.string(x))
-  if (is_url(x)) {
+  assert_that(is.character(x))
+  are_urls <- are_urls(x)
+  if (any(are_urls)) {
+    if (!all(are_urls)) {
+      stop("Vectors of mixed paths and URIs are not supported", call. = FALSE)
+    }
     if (!is.null(filesystem)) {
       # Stop? Can't have URL (which yields a fs) and another fs
     }
-    FileSystem$from_uri(x)
+    x <- lapply(x, FileSystem$from_uri)
+    if (length(unique(map(x, ~class(.$fs)))) > 1) {
+      stop(
+        "Vectors of URIs for different file systems are not supported",
+        call. = FALSE
+      )
+    }
+    fs  <- x[[1]]$fs
+    path <- map_chr(x, ~.$path) # singular name "path" used for compatibility
   } else {
-    list(
-      fs = filesystem %||% LocalFileSystem$create(),
-      path = clean_path_abs(x)
-    )
+    fs <- filesystem %||% LocalFileSystem$create()
+    if (inherits(fs, "LocalFileSystem")) {
+      path <- clean_path_abs(x)
+    } else {
+      path <- clean_path_rel(x)
+    }
   }
+  list(
+    fs = fs,
+    path = path
+  )
+}
+
+# variant of the above function that asserts that x is either a scalar string
+# or a SubTreeFileSystem
+get_path_and_filesystem <- function(x, filesystem = NULL) {
+  assert_that(is.string(x) || inherits(x, "SubTreeFileSystem"))
+  get_paths_and_filesystem(x, filesystem)
 }
 
 is_url <- function(x) is.string(x) && grepl("://", x)
+are_urls <- function(x) if (!is.character(x)) FALSE else grepl("://", x)
 
 #' @usage NULL
 #' @format NULL
@@ -326,7 +327,7 @@ is_url <- function(x) is.string(x) && grepl("://", x)
 #' @export
 LocalFileSystem <- R6Class("LocalFileSystem", inherit = FileSystem)
 LocalFileSystem$create <- function() {
-  shared_ptr(LocalFileSystem, fs___LocalFileSystem__create())
+  fs___LocalFileSystem__create()
 }
 
 #' @usage NULL
@@ -369,7 +370,7 @@ S3FileSystem$create <- function(anonymous = FALSE, ...) {
     }
   }
   args <- c(modifyList(default_s3_options, args), anonymous = anonymous)
-  shared_ptr(S3FileSystem, exec(fs___S3FileSystem__create, !!!args))
+  exec(fs___S3FileSystem__create, !!!args)
 }
 
 default_s3_options <- list(
@@ -427,29 +428,40 @@ s3_bucket <- function(bucket, ...) {
 #' @rdname FileSystem
 #' @export
 SubTreeFileSystem <- R6Class("SubTreeFileSystem", inherit = FileSystem,
+  public = list(
+    print = function(...) {
+      if (inherits(self$base_fs, "LocalFileSystem")) {
+        cat("SubTreeFileSystem: ", "file://", self$base_path, "\n", sep = "")
+      } else if (inherits(self$base_fs, "S3FileSystem")) {
+        cat("SubTreeFileSystem: ", "s3://", self$base_path, "\n", sep = "")
+      } else {
+        cat("SubTreeFileSystem", "\n", sep = "")
+      }
+      invisible(self)
+    }
+  ),
   active = list(
     base_fs = function() {
-      shared_ptr(FileSystem, fs___SubTreeFileSystem__base_fs(self))$..dispatch()
+      fs___SubTreeFileSystem__base_fs(self)
     },
     base_path = function() fs___SubTreeFileSystem__base_path(self)
   )
 )
 SubTreeFileSystem$create <- function(base_path, base_fs = NULL) {
   fs_and_path <- get_path_and_filesystem(base_path, base_fs)
-  shared_ptr(
-    SubTreeFileSystem,
-    fs___SubTreeFileSystem__create(fs_and_path$path, fs_and_path$fs)
-  )
+  fs___SubTreeFileSystem__create(fs_and_path$path, fs_and_path$fs)
 }
 
 #' @export
 `$.SubTreeFileSystem` <- function(x, name, ...) {
   # This is to allow delegating methods/properties to the base_fs
   assert_that(is.string(name))
-  if (name %in% ls(x)) {
+  if (name %in% ls(envir = x)) {
     get(name, x)
-  } else {
+  } else if (name %in% ls(envir = x$base_fs)) {
     get(name, x$base_fs)
+  } else {
+    NULL
   }
 }
 

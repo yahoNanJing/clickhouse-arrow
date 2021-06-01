@@ -16,6 +16,7 @@
 // under the License.
 
 #include "gandiva/function_registry_string.h"
+
 #include "gandiva/function_registry_common.h"
 
 namespace gandiva {
@@ -61,20 +62,51 @@ std::vector<NativeFunction> GetStringFunctionRegistry() {
       UNARY_SAFE_NULL_NEVER_BOOL_FN(isnull, {}),
       UNARY_SAFE_NULL_NEVER_BOOL_FN(isnotnull, {}),
 
-      UNARY_UNSAFE_NULL_IF_NULL(castINT, {}, utf8, int32),
-      UNARY_UNSAFE_NULL_IF_NULL(castBIGINT, {}, utf8, int64),
-      UNARY_UNSAFE_NULL_IF_NULL(castFLOAT4, {}, utf8, float32),
-      UNARY_UNSAFE_NULL_IF_NULL(castFLOAT8, {}, utf8, float64),
-
       NativeFunction("upper", {}, DataTypeVector{utf8()}, utf8(), kResultNullIfNull,
                      "upper_utf8", NativeFunction::kNeedsContext),
 
       NativeFunction("lower", {}, DataTypeVector{utf8()}, utf8(), kResultNullIfNull,
                      "lower_utf8", NativeFunction::kNeedsContext),
 
+      NativeFunction("castINT", {}, DataTypeVector{utf8()}, int32(), kResultNullIfNull,
+                     "gdv_fn_castINT_utf8",
+                     NativeFunction::kNeedsContext | NativeFunction::kCanReturnErrors),
+
+      NativeFunction("castBIGINT", {}, DataTypeVector{utf8()}, int64(), kResultNullIfNull,
+                     "gdv_fn_castBIGINT_utf8",
+                     NativeFunction::kNeedsContext | NativeFunction::kCanReturnErrors),
+
+      NativeFunction("castFLOAT4", {}, DataTypeVector{utf8()}, float32(),
+                     kResultNullIfNull, "gdv_fn_castFLOAT4_utf8",
+                     NativeFunction::kNeedsContext | NativeFunction::kCanReturnErrors),
+
+      NativeFunction("castFLOAT8", {}, DataTypeVector{utf8()}, float64(),
+                     kResultNullIfNull, "gdv_fn_castFLOAT8_utf8",
+                     NativeFunction::kNeedsContext | NativeFunction::kCanReturnErrors),
+
+      NativeFunction("castVARCHAR", {}, DataTypeVector{boolean(), int64()}, utf8(),
+                     kResultNullIfNull, "castVARCHAR_bool_int64",
+                     NativeFunction::kNeedsContext),
+
       NativeFunction("castVARCHAR", {}, DataTypeVector{utf8(), int64()}, utf8(),
                      kResultNullIfNull, "castVARCHAR_utf8_int64",
                      NativeFunction::kNeedsContext),
+
+      NativeFunction("castVARCHAR", {}, DataTypeVector{int32(), int64()}, utf8(),
+                     kResultNullIfNull, "gdv_fn_castVARCHAR_int32_int64",
+                     NativeFunction::kNeedsContext | NativeFunction::kCanReturnErrors),
+
+      NativeFunction("castVARCHAR", {}, DataTypeVector{int64(), int64()}, utf8(),
+                     kResultNullIfNull, "gdv_fn_castVARCHAR_int64_int64",
+                     NativeFunction::kNeedsContext | NativeFunction::kCanReturnErrors),
+
+      NativeFunction("castVARCHAR", {}, DataTypeVector{float32(), int64()}, utf8(),
+                     kResultNullIfNull, "gdv_fn_castVARCHAR_float32_int64",
+                     NativeFunction::kNeedsContext | NativeFunction::kCanReturnErrors),
+
+      NativeFunction("castVARCHAR", {}, DataTypeVector{float64(), int64()}, utf8(),
+                     kResultNullIfNull, "gdv_fn_castVARCHAR_float64_int64",
+                     NativeFunction::kNeedsContext | NativeFunction::kCanReturnErrors),
 
       NativeFunction("castVARCHAR", {}, DataTypeVector{decimal128(), int64()}, utf8(),
                      kResultNullIfNull, "castVARCHAR_decimal128_int64",
@@ -186,6 +218,11 @@ std::vector<NativeFunction> GetStringFunctionRegistry() {
 
       NativeFunction("convert_fromUTF8", {"convert_fromutf8"}, DataTypeVector{binary()},
                      utf8(), kResultNullIfNull, "convert_fromUTF8_binary",
+                     NativeFunction::kNeedsContext),
+
+      NativeFunction("convert_replaceUTF8", {"convert_replaceutf8"},
+                     DataTypeVector{binary(), utf8()}, utf8(), kResultNullIfNull,
+                     "convert_replace_invalid_fromUTF8_binary",
                      NativeFunction::kNeedsContext),
 
       NativeFunction("locate", {"position"}, DataTypeVector{utf8(), utf8(), int32()},

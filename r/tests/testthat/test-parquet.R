@@ -15,9 +15,11 @@
 # specific language governing permissions and limitations
 # under the License.
 
+skip_if_not_available("parquet")
+
 context("Parquet file reading/writing")
 
-pq_file <- system.file("v0.7.1.parquet", package="arrow")
+pq_file <- system.file("v0.7.1.parquet", package = "arrow")
 
 test_that("reading a known Parquet file to tibble", {
   skip_if_not_available("snappy")
@@ -96,6 +98,12 @@ test_that("write_parquet() handles various write_statistics= specs", {
   expect_parquet_roundtrip(tab, write_statistics = TRUE)
   expect_parquet_roundtrip(tab, write_statistics = c(TRUE, FALSE, TRUE))
   expect_parquet_roundtrip(tab, write_statistics = c(x1 = TRUE, x2 = TRUE))
+})
+
+test_that("write_parquet() accepts RecordBatch too", {
+  batch <- RecordBatch$create(x1 = 1:5, x2 = 1:5, y = 1:5)
+  tab <- parquet_roundtrip(batch)
+  expect_equivalent(tab, Table$create(batch))
 })
 
 test_that("write_parquet() can truncate timestamps", {
@@ -225,4 +233,22 @@ test_that("ParquetFileReader $ReadRowGroup(s) methods", {
 
   expect_true(reader$ReadRowGroups(c(0, 1), 0) == Table$create(x = 1:20))
   expect_error(reader$ReadRowGroups(c(0, 1), 1))
+})
+
+test_that("Error messages are shown when the compression algorithm snappy is not found", {
+  msg <- "NotImplemented: Support for codec 'snappy' not built\nIn order to read this file, you will need to reinstall arrow with additional features enabled.\nSet one of these environment variables before installing:\n\n * LIBARROW_MINIMAL=false (for all optional features, including 'snappy')\n * ARROW_WITH_SNAPPY=ON (for just 'snappy')\n\nSee https://arrow.apache.org/docs/r/articles/install.html for details"
+
+  if (codec_is_available("snappy")) {
+    d <- read_parquet(pq_file)
+    expect_is(d, "data.frame")
+  } else {
+    expect_error(read_parquet(pq_file), msg, fixed = TRUE)
+  }
+})
+
+test_that("Error is created when parquet reads a feather file", {
+  expect_error(
+    read_parquet(test_path("golden-files/data-arrow_2.0.0_lz4.feather")),
+    "Parquet magic bytes not found in footer"
+  )
 })

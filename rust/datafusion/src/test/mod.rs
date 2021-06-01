@@ -19,21 +19,21 @@
 
 use crate::datasource::{MemTable, TableProvider};
 use crate::error::Result;
-use crate::execution::context::ExecutionContext;
 use crate::logical_plan::{LogicalPlan, LogicalPlanBuilder};
-use crate::physical_plan::ExecutionPlan;
-use arrow::array;
-use arrow::array::PrimitiveArrayOps;
+use array::{
+    Array, ArrayRef, StringArray, TimestampMicrosecondArray, TimestampMillisecondArray,
+    TimestampNanosecondArray, TimestampSecondArray,
+};
+use arrow::array::{self, Int32Array};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
-use std::env;
 use std::fs::File;
 use std::io::prelude::*;
 use std::io::{BufReader, BufWriter};
 use std::sync::Arc;
 use tempfile::TempDir;
 
-pub fn create_table_dual() -> Box<dyn TableProvider + Send + Sync> {
+pub fn create_table_dual() -> Arc<dyn TableProvider> {
     let dual_schema = Arc::new(Schema::new(vec![
         Field::new("id", DataType::Int32, false),
         Field::new("name", DataType::Utf8, false),
@@ -46,24 +46,13 @@ pub fn create_table_dual() -> Box<dyn TableProvider + Send + Sync> {
         ],
     )
     .unwrap();
-    let provider = MemTable::new(dual_schema.clone(), vec![vec![batch.clone()]]).unwrap();
-    Box::new(provider)
-}
-
-/// Get the value of the ARROW_TEST_DATA environment variable
-pub fn arrow_testdata_path() -> String {
-    env::var("ARROW_TEST_DATA").expect("ARROW_TEST_DATA not defined")
-}
-
-/// Execute a physical plan and collect the results
-pub async fn execute(plan: Arc<dyn ExecutionPlan>) -> Result<Vec<RecordBatch>> {
-    let ctx = ExecutionContext::new();
-    ctx.collect(plan).await
+    let provider = MemTable::try_new(dual_schema, vec![vec![batch]]).unwrap();
+    Arc::new(provider)
 }
 
 /// Generated partitioned copy of a CSV file
 pub fn create_partitioned_csv(filename: &str, partitions: usize) -> Result<String> {
-    let testdata = arrow_testdata_path();
+    let testdata = arrow::util::test_util::arrow_test_data();
     let path = format!("{}/csv/{}", testdata, filename);
 
     let tmp_dir = TempDir::new()?;
@@ -79,8 +68,7 @@ pub fn create_partitioned_csv(filename: &str, partitions: usize) -> Result<Strin
 
     let f = File::open(&path)?;
     let f = BufReader::new(f);
-    let mut i = 0;
-    for line in f.lines() {
+    for (i, line) in f.lines().enumerate() {
         let line = line.unwrap();
 
         if i == 0 {
@@ -95,8 +83,6 @@ pub fn create_partitioned_csv(filename: &str, partitions: usize) -> Result<Strin
             writers[partition].write_all(line.as_bytes()).unwrap();
             writers[partition].write_all(b"\n").unwrap();
         }
-
-        i += 1;
     }
     for w in writers.iter_mut() {
         w.flush().unwrap();
@@ -124,120 +110,14 @@ pub fn aggr_test_schema() -> SchemaRef {
     ]))
 }
 
-/// Format a batch as csv
-pub fn format_batch(batch: &RecordBatch) -> Vec<String> {
-    let mut rows = vec![];
-    for row_index in 0..batch.num_rows() {
-        let mut s = String::new();
-        for column_index in 0..batch.num_columns() {
-            if column_index > 0 {
-                s.push(',');
-            }
-            let array = batch.column(column_index);
-            match array.data_type() {
-                DataType::Utf8 => s.push_str(
-                    array
-                        .as_any()
-                        .downcast_ref::<array::StringArray>()
-                        .unwrap()
-                        .value(row_index),
-                ),
-                DataType::Int8 => s.push_str(&format!(
-                    "{:?}",
-                    array
-                        .as_any()
-                        .downcast_ref::<array::Int8Array>()
-                        .unwrap()
-                        .value(row_index)
-                )),
-                DataType::Int16 => s.push_str(&format!(
-                    "{:?}",
-                    array
-                        .as_any()
-                        .downcast_ref::<array::Int16Array>()
-                        .unwrap()
-                        .value(row_index)
-                )),
-                DataType::Int32 => s.push_str(&format!(
-                    "{:?}",
-                    array
-                        .as_any()
-                        .downcast_ref::<array::Int32Array>()
-                        .unwrap()
-                        .value(row_index)
-                )),
-                DataType::Int64 => s.push_str(&format!(
-                    "{:?}",
-                    array
-                        .as_any()
-                        .downcast_ref::<array::Int64Array>()
-                        .unwrap()
-                        .value(row_index)
-                )),
-                DataType::UInt8 => s.push_str(&format!(
-                    "{:?}",
-                    array
-                        .as_any()
-                        .downcast_ref::<array::UInt8Array>()
-                        .unwrap()
-                        .value(row_index)
-                )),
-                DataType::UInt16 => s.push_str(&format!(
-                    "{:?}",
-                    array
-                        .as_any()
-                        .downcast_ref::<array::UInt16Array>()
-                        .unwrap()
-                        .value(row_index)
-                )),
-                DataType::UInt32 => s.push_str(&format!(
-                    "{:?}",
-                    array
-                        .as_any()
-                        .downcast_ref::<array::UInt32Array>()
-                        .unwrap()
-                        .value(row_index)
-                )),
-                DataType::UInt64 => s.push_str(&format!(
-                    "{:?}",
-                    array
-                        .as_any()
-                        .downcast_ref::<array::UInt64Array>()
-                        .unwrap()
-                        .value(row_index)
-                )),
-                DataType::Float32 => s.push_str(&format!(
-                    "{:?}",
-                    array
-                        .as_any()
-                        .downcast_ref::<array::Float32Array>()
-                        .unwrap()
-                        .value(row_index)
-                )),
-                DataType::Float64 => s.push_str(&format!(
-                    "{:?}",
-                    array
-                        .as_any()
-                        .downcast_ref::<array::Float64Array>()
-                        .unwrap()
-                        .value(row_index)
-                )),
-                _ => s.push('?'),
-            }
-        }
-        rows.push(s);
-    }
-    rows
-}
-
-/// all tests share a common table
+/// some tests share a common table
 pub fn test_table_scan() -> Result<LogicalPlan> {
     let schema = Schema::new(vec![
         Field::new("a", DataType::UInt32, false),
         Field::new("b", DataType::UInt32, false),
         Field::new("c", DataType::UInt32, false),
     ]);
-    LogicalPlanBuilder::scan("default", "test", &schema, None)?.build()
+    LogicalPlanBuilder::scan_empty("test", &schema, None)?.build()
 }
 
 pub fn assert_fields_eq(plan: &LogicalPlan, expected: Vec<&str>) {
@@ -250,51 +130,217 @@ pub fn assert_fields_eq(plan: &LogicalPlan, expected: Vec<&str>) {
     assert_eq!(actual, expected);
 }
 
+/// returns a table with 3 columns of i32 in memory
+pub fn build_table_i32(
+    a: (&str, &Vec<i32>),
+    b: (&str, &Vec<i32>),
+    c: (&str, &Vec<i32>),
+) -> RecordBatch {
+    let schema = Schema::new(vec![
+        Field::new(a.0, DataType::Int32, false),
+        Field::new(b.0, DataType::Int32, false),
+        Field::new(c.0, DataType::Int32, false),
+    ]);
+
+    RecordBatch::try_new(
+        Arc::new(schema),
+        vec![
+            Arc::new(Int32Array::from(a.1.clone())),
+            Arc::new(Int32Array::from(b.1.clone())),
+            Arc::new(Int32Array::from(c.1.clone())),
+        ],
+    )
+    .unwrap()
+}
+
+/// Returns the column names on the schema
+pub fn columns(schema: &Schema) -> Vec<String> {
+    schema.fields().iter().map(|f| f.name().clone()).collect()
+}
+
+/// Return a new table provider that has a single Int32 column with
+/// values between `seq_start` and `seq_end`
+pub fn table_with_sequence(
+    seq_start: i32,
+    seq_end: i32,
+) -> Result<Arc<dyn TableProvider>> {
+    let schema = Arc::new(Schema::new(vec![Field::new("i", DataType::Int32, true)]));
+    let arr = Arc::new(Int32Array::from((seq_start..=seq_end).collect::<Vec<_>>()));
+    let partitions = vec![vec![RecordBatch::try_new(
+        schema.clone(),
+        vec![arr as ArrayRef],
+    )?]];
+    Ok(Arc::new(MemTable::try_new(schema, partitions)?))
+}
+
+/// Return a RecordBatch with a single Int32 array with values (0..sz)
+pub fn make_partition(sz: i32) -> RecordBatch {
+    let seq_start = 0;
+    let seq_end = sz;
+    let values = (seq_start..seq_end).collect::<Vec<_>>();
+    let schema = Arc::new(Schema::new(vec![Field::new("i", DataType::Int32, true)]));
+    let arr = Arc::new(Int32Array::from(values));
+    let arr = arr as ArrayRef;
+
+    RecordBatch::try_new(schema, vec![arr]).unwrap()
+}
+
+/// Return a new table provider containing all of the supported timestamp types
+pub fn table_with_timestamps() -> Arc<dyn TableProvider> {
+    let batch = make_timestamps();
+    let schema = batch.schema();
+    let partitions = vec![vec![batch]];
+    Arc::new(MemTable::try_new(schema, partitions).unwrap())
+}
+
+/// Return  record batch with all of the supported timestamp types
+/// values
+///
+/// Columns are named:
+/// "nanos" --> TimestampNanosecondArray
+/// "micros" --> TimestampMicrosecondArray
+/// "millis" --> TimestampMillisecondArray
+/// "secs" --> TimestampSecondArray
+/// "names" --> StringArray
+pub fn make_timestamps() -> RecordBatch {
+    let ts_strings = vec![
+        Some("2018-11-13T17:11:10.011375885995"),
+        Some("2011-12-13T11:13:10.12345"),
+        None,
+        Some("2021-1-1T05:11:10.432"),
+    ];
+
+    let ts_nanos = ts_strings
+        .into_iter()
+        .map(|t| {
+            t.map(|t| {
+                t.parse::<chrono::NaiveDateTime>()
+                    .unwrap()
+                    .timestamp_nanos()
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let ts_micros = ts_nanos
+        .iter()
+        .map(|t| t.as_ref().map(|ts_nanos| ts_nanos / 1000))
+        .collect::<Vec<_>>();
+
+    let ts_millis = ts_nanos
+        .iter()
+        .map(|t| t.as_ref().map(|ts_nanos| ts_nanos / 1000000))
+        .collect::<Vec<_>>();
+
+    let ts_secs = ts_nanos
+        .iter()
+        .map(|t| t.as_ref().map(|ts_nanos| ts_nanos / 1000000000))
+        .collect::<Vec<_>>();
+
+    let names = ts_nanos
+        .iter()
+        .enumerate()
+        .map(|(i, _)| format!("Row {}", i))
+        .collect::<Vec<_>>();
+
+    let arr_nanos = TimestampNanosecondArray::from_opt_vec(ts_nanos, None);
+    let arr_micros = TimestampMicrosecondArray::from_opt_vec(ts_micros, None);
+    let arr_millis = TimestampMillisecondArray::from_opt_vec(ts_millis, None);
+    let arr_secs = TimestampSecondArray::from_opt_vec(ts_secs, None);
+
+    let names = names.iter().map(|s| s.as_str()).collect::<Vec<_>>();
+    let arr_names = StringArray::from(names);
+
+    let schema = Schema::new(vec![
+        Field::new("nanos", arr_nanos.data_type().clone(), false),
+        Field::new("micros", arr_micros.data_type().clone(), false),
+        Field::new("millis", arr_millis.data_type().clone(), false),
+        Field::new("secs", arr_secs.data_type().clone(), false),
+        Field::new("name", arr_names.data_type().clone(), false),
+    ]);
+    let schema = Arc::new(schema);
+
+    RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(arr_nanos),
+            Arc::new(arr_micros),
+            Arc::new(arr_millis),
+            Arc::new(arr_secs),
+            Arc::new(arr_names),
+        ],
+    )
+    .unwrap()
+}
+
+pub mod exec;
+pub mod user_defined;
 pub mod variable;
 
-mod tests {
-    use super::*;
+/// Compares formatted output of a record batch with an expected
+/// vector of strings, with the result of pretty formatting record
+/// batches. This is a macro so errors appear on the correct line
+///
+/// Designed so that failure output can be directly copy/pasted
+/// into the test code as expected results.
+///
+/// Expects to be called about like this:
+///
+/// `assert_batch_eq!(expected_lines: &[&str], batches: &[RecordBatch])`
+#[macro_export]
+macro_rules! assert_batches_eq {
+    ($EXPECTED_LINES: expr, $CHUNKS: expr) => {
+        let expected_lines: Vec<String> =
+            $EXPECTED_LINES.iter().map(|&s| s.into()).collect();
 
-    use arrow::array::{BooleanArray, Int32Array, StringArray};
-    use arrow::datatypes::{DataType, Field, Schema};
-    use arrow::record_batch::RecordBatch;
+        let formatted = arrow::util::pretty::pretty_format_batches($CHUNKS).unwrap();
 
-    #[test]
-    fn test_format_batch() -> Result<()> {
-        let array_int32 = Int32Array::from(vec![1000, 2000]);
-        let array_string = StringArray::from(vec!["bow \u{1F3F9}", "arrow \u{2191}"]);
+        let actual_lines: Vec<&str> = formatted.trim().lines().collect();
 
-        let schema = Schema::new(vec![
-            Field::new("a", DataType::Int32, false),
-            Field::new("b", DataType::Utf8, false),
-        ]);
+        assert_eq!(
+            expected_lines, actual_lines,
+            "\n\nexpected:\n\n{:#?}\nactual:\n\n{:#?}\n\n",
+            expected_lines, actual_lines
+        );
+    };
+}
 
-        let record_batch = RecordBatch::try_new(
-            Arc::new(schema),
-            vec![Arc::new(array_int32), Arc::new(array_string)],
-        )?;
+/// Compares formatted output of a record batch with an expected
+/// vector of strings in a way that order does not matter.
+/// This is a macro so errors appear on the correct line
+///
+/// Designed so that failure output can be directly copy/pasted
+/// into the test code as expected results.
+///
+/// Expects to be called about like this:
+///
+/// `assert_batch_sorted_eq!(expected_lines: &[&str], batches: &[RecordBatch])`
+#[macro_export]
+macro_rules! assert_batches_sorted_eq {
+    ($EXPECTED_LINES: expr, $CHUNKS: expr) => {
+        let mut expected_lines: Vec<String> =
+            $EXPECTED_LINES.iter().map(|&s| s.into()).collect();
 
-        let result = format_batch(&record_batch);
+        // sort except for header + footer
+        let num_lines = expected_lines.len();
+        if num_lines > 3 {
+            expected_lines.as_mut_slice()[2..num_lines - 1].sort_unstable()
+        }
 
-        assert_eq!(result, vec!["1000,bow \u{1F3F9}", "2000,arrow \u{2191}"]);
+        let formatted = arrow::util::pretty::pretty_format_batches($CHUNKS).unwrap();
+        // fix for windows: \r\n -->
 
-        Ok(())
-    }
+        let mut actual_lines: Vec<&str> = formatted.trim().lines().collect();
 
-    #[test]
-    fn test_format_batch_unknown() -> Result<()> {
-        // Use any Array type not yet handled by format_batch().
-        let array_bool = BooleanArray::from(vec![false, true]);
+        // sort except for header + footer
+        let num_lines = actual_lines.len();
+        if num_lines > 3 {
+            actual_lines.as_mut_slice()[2..num_lines - 1].sort_unstable()
+        }
 
-        let schema = Schema::new(vec![Field::new("a", DataType::Boolean, false)]);
-
-        let record_batch =
-            RecordBatch::try_new(Arc::new(schema), vec![Arc::new(array_bool)])?;
-
-        let result = format_batch(&record_batch);
-
-        assert_eq!(result, vec!["?", "?"]);
-
-        Ok(())
-    }
+        assert_eq!(
+            expected_lines, actual_lines,
+            "\n\nexpected:\n\n{:#?}\nactual:\n\n{:#?}\n\n",
+            expected_lines, actual_lines
+        );
+    };
 }

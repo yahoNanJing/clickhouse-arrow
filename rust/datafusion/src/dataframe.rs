@@ -19,8 +19,9 @@
 
 use crate::arrow::record_batch::RecordBatch;
 use crate::error::Result;
-use crate::logical_plan::{Expr, FunctionRegistry, LogicalPlan};
-use arrow::datatypes::Schema;
+use crate::logical_plan::{
+    DFSchema, Expr, FunctionRegistry, JoinType, LogicalPlan, Partitioning,
+};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -50,7 +51,7 @@ use async_trait::async_trait;
 /// # }
 /// ```
 #[async_trait]
-pub trait DataFrame {
+pub trait DataFrame: Send + Sync {
     /// Filter the DataFrame by column. Returns a new DataFrame only containing the
     /// specified columns.
     ///
@@ -60,11 +61,11 @@ pub trait DataFrame {
     /// # fn main() -> Result<()> {
     /// let mut ctx = ExecutionContext::new();
     /// let df = ctx.read_csv("tests/example.csv", CsvReadOptions::new())?;
-    /// let df = df.select_columns(vec!["a", "b"])?;
+    /// let df = df.select_columns(&["a", "b"])?;
     /// # Ok(())
     /// # }
     /// ```
-    fn select_columns(&self, columns: Vec<&str>) -> Result<Arc<dyn DataFrame>>;
+    fn select_columns(&self, columns: &[&str]) -> Result<Arc<dyn DataFrame>>;
 
     /// Create a projection based on arbitrary expressions.
     ///
@@ -131,6 +132,20 @@ pub trait DataFrame {
     /// ```
     fn limit(&self, n: usize) -> Result<Arc<dyn DataFrame>>;
 
+    /// Calculate the union two [`DataFrame`]s.  The two [`DataFrame`]s must have exactly the same schema
+    ///
+    /// ```
+    /// # use datafusion::prelude::*;
+    /// # use datafusion::error::Result;
+    /// # fn main() -> Result<()> {
+    /// let mut ctx = ExecutionContext::new();
+    /// let df = ctx.read_csv("tests/example.csv", CsvReadOptions::new())?;
+    /// let df = df.union(df.clone())?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    fn union(&self, dataframe: Arc<dyn DataFrame>) -> Result<Arc<dyn DataFrame>>;
+
     /// Sort the DataFrame by the specified sorting expressions. Any expression can be turned into
     /// a sort expression by calling its [sort](../logical_plan/enum.Expr.html#method.sort) method.
     ///
@@ -145,6 +160,50 @@ pub trait DataFrame {
     /// # }
     /// ```
     fn sort(&self, expr: Vec<Expr>) -> Result<Arc<dyn DataFrame>>;
+
+    /// Join this DataFrame with another DataFrame using the specified columns as join keys
+    ///
+    /// ```
+    /// # use datafusion::prelude::*;
+    /// # use datafusion::error::Result;
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<()> {
+    /// let mut ctx = ExecutionContext::new();
+    /// let left = ctx.read_csv("tests/example.csv", CsvReadOptions::new())?;
+    /// let right = ctx.read_csv("tests/example.csv", CsvReadOptions::new())?
+    ///   .select(vec![
+    ///     col("a").alias("a2"),
+    ///     col("b").alias("b2"),
+    ///     col("c").alias("c2")])?;
+    /// let join = left.join(right, JoinType::Inner, &["a", "b"], &["a2", "b2"])?;
+    /// let batches = join.collect().await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    fn join(
+        &self,
+        right: Arc<dyn DataFrame>,
+        join_type: JoinType,
+        left_cols: &[&str],
+        right_cols: &[&str],
+    ) -> Result<Arc<dyn DataFrame>>;
+
+    /// Repartition a DataFrame based on a logical partitioning scheme.
+    ///
+    /// ```
+    /// # use datafusion::prelude::*;
+    /// # use datafusion::error::Result;
+    /// # fn main() -> Result<()> {
+    /// let mut ctx = ExecutionContext::new();
+    /// let df = ctx.read_csv("tests/example.csv", CsvReadOptions::new())?;
+    /// let df1 = df.repartition(Partitioning::RoundRobinBatch(4))?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    fn repartition(
+        &self,
+        partitioning_scheme: Partitioning,
+    ) -> Result<Arc<dyn DataFrame>>;
 
     /// Executes this DataFrame and collects all results into a vector of RecordBatch.
     ///
@@ -161,6 +220,22 @@ pub trait DataFrame {
     /// ```
     async fn collect(&self) -> Result<Vec<RecordBatch>>;
 
+    /// Executes this DataFrame and collects all results into a vector of vector of RecordBatch
+    /// maintaining the input partitioning.
+    ///
+    /// ```
+    /// # use datafusion::prelude::*;
+    /// # use datafusion::error::Result;
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<()> {
+    /// let mut ctx = ExecutionContext::new();
+    /// let df = ctx.read_csv("tests/example.csv", CsvReadOptions::new())?;
+    /// let batches = df.collect_partitioned().await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    async fn collect_partitioned(&self) -> Result<Vec<Vec<RecordBatch>>>;
+
     /// Returns the schema describing the output of this DataFrame in terms of columns returned,
     /// where each column has a name, data type, and nullability attribute.
 
@@ -174,7 +249,7 @@ pub trait DataFrame {
     /// # Ok(())
     /// # }
     /// ```
-    fn schema(&self) -> &Schema;
+    fn schema(&self) -> &DFSchema;
 
     /// Return the logical plan represented by this DataFrame.
     fn to_logical_plan(&self) -> LogicalPlan;
@@ -207,5 +282,5 @@ pub trait DataFrame {
     /// # Ok(())
     /// # }
     /// ```
-    fn registry(&self) -> &dyn FunctionRegistry;
+    fn registry(&self) -> Arc<dyn FunctionRegistry>;
 }

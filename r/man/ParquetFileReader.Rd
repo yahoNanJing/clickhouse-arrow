@@ -15,7 +15,7 @@ takes the following arguments:
 \itemize{
 \item \code{file} A character file name, raw vector, or Arrow file connection object
 (e.g. \code{RandomAccessFile}).
-\item \code{props} Optional \link{ParquetReaderProperties}
+\item \code{props} Optional \link{ParquetArrowReaderProperties}
 \item \code{mmap} Logical: whether to memory-map the file (default \code{TRUE})
 \item \code{...} Additional arguments, currently ignored
 }
@@ -45,7 +45,7 @@ The optional \verb{column_indices=} argument is a 0-based integer vector indicat
 }
 
 \examples{
-\donttest{
+\dontrun{
 f <- system.file("v0.7.1.parquet", package="arrow")
 pq <- ParquetFileReader$create(f)
 pq$GetSchema()
