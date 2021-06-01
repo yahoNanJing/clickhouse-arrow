@@ -19,8 +19,15 @@
 
 namespace arrow {
 
-template <typename T>
-class Future;
+namespace detail {
+struct Empty;
+}  // namespace detail
+
+template <typename T = detail::Empty>
+class WeakFuture;
+class FutureWaiter;
+
+class TimestampParser;
 
 namespace internal {
 
@@ -29,4 +36,27 @@ class TaskGroup;
 class ThreadPool;
 
 }  // namespace internal
+
+struct Compression {
+  /// \brief Compression algorithm
+  enum type {
+    UNCOMPRESSED,
+    SNAPPY,
+    GZIP,
+    BROTLI,
+    ZSTD,
+    LZ4,
+    LZ4_FRAME,
+    LZO,
+    BZ2,
+    LZ4_HADOOP
+  };
+};
+
+namespace util {
+class Compressor;
+class Decompressor;
+class Codec;
+}  // namespace util
+
 }  // namespace arrow

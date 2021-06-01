@@ -65,7 +65,7 @@ func (f *flightServer) ListFlights(c *flight.Criteria, fs flight.FlightService_L
 		}
 
 		fs.Send(&flight.FlightInfo{
-			Schema: ipc.FlightInfoSchemaBytes(recs[0].Schema(), f.getmem()),
+			Schema: flight.SerializeSchema(recs[0].Schema(), f.getmem()),
 			FlightDescriptor: &flight.FlightDescriptor{
 				Type: flight.FlightDescriptor_PATH,
 				Path: []string{name, auth},
@@ -88,13 +88,13 @@ func (f *flightServer) GetSchema(_ context.Context, in *flight.FlightDescriptor)
 		return nil, status.Error(codes.NotFound, "flight not found")
 	}
 
-	return &flight.SchemaResult{Schema: ipc.FlightInfoSchemaBytes(recs[0].Schema(), f.getmem())}, nil
+	return &flight.SchemaResult{Schema: flight.SerializeSchema(recs[0].Schema(), f.getmem())}, nil
 }
 
 func (f *flightServer) DoGet(tkt *flight.Ticket, fs flight.FlightService_DoGetServer) error {
 	recs := arrdata.Records[string(tkt.GetTicket())]
 
-	w := ipc.NewFlightDataWriter(fs, ipc.WithSchema(recs[0].Schema()))
+	w := flight.NewRecordWriter(fs, ipc.WithSchema(recs[0].Schema()))
 	for _, r := range recs {
 		w.Write(r)
 	}
@@ -105,9 +105,13 @@ func (f *flightServer) DoGet(tkt *flight.Ticket, fs flight.FlightService_DoGetSe
 type servAuth struct{}
 
 func (a *servAuth) Authenticate(c flight.AuthConn) error {
-	_, err := c.Read()
+	tok, err := c.Read()
 	if err == io.EOF {
 		return nil
+	}
+
+	if string(tok) != "foobar" {
+		return errors.New("novalid")
 	}
 
 	if err != nil {
@@ -124,10 +128,12 @@ func (a *servAuth) IsValid(token string) (interface{}, error) {
 	return "", errors.New("novalid")
 }
 
+type ctxauth struct{}
+
 type clientAuth struct{}
 
-func (a *clientAuth) Authenticate(c flight.AuthConn) error {
-	if err := c.Send([]byte("foobar")); err != nil {
+func (a *clientAuth) Authenticate(ctx context.Context, c flight.AuthConn) error {
+	if err := c.Send(ctx.Value(ctxauth{}).([]byte)); err != nil {
 		return err
 	}
 
@@ -135,8 +141,8 @@ func (a *clientAuth) Authenticate(c flight.AuthConn) error {
 	return err
 }
 
-func (a *clientAuth) GetToken() (string, error) {
-	return "baz", nil
+func (a *clientAuth) GetToken(ctx context.Context) (string, error) {
+	return ctx.Value(ctxauth{}).(string), nil
 }
 
 func TestListFlights(t *testing.T) {
@@ -175,7 +181,7 @@ func TestListFlights(t *testing.T) {
 			t.Fatalf("got unknown flight info: %s", fname)
 		}
 
-		sc, err := ipc.SchemaFromFlightInfo(info.GetSchema())
+		sc, err := flight.DeserializeSchema(info.GetSchema(), f.mem)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -219,7 +225,7 @@ func TestGetSchema(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			schema, err := ipc.SchemaFromFlightInfo(res.GetSchema())
+			schema, err := flight.DeserializeSchema(res.GetSchema(), f.getmem())
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -251,12 +257,14 @@ func TestServer(t *testing.T) {
 	}
 	defer client.Close()
 
-	err = client.Authenticate(context.Background())
+	err = client.Authenticate(context.WithValue(context.Background(), ctxauth{}, []byte("foobar")))
 	if err != nil {
 		t.Error(err)
 	}
 
-	fistream, err := client.ListFlights(context.Background(), &flight.Criteria{Expression: []byte("decimal128")})
+	ctx := context.WithValue(context.Background(), ctxauth{}, "baz")
+
+	fistream, err := client.ListFlights(ctx, &flight.Criteria{Expression: []byte("decimal128")})
 	if err != nil {
 		t.Error(err)
 	}
@@ -270,12 +278,12 @@ func TestServer(t *testing.T) {
 		t.Fatalf("path should have auth info: want %s got %s", "bar", fi.FlightDescriptor.GetPath()[1])
 	}
 
-	fdata, err := client.DoGet(context.Background(), &flight.Ticket{Ticket: []byte("decimal128")})
+	fdata, err := client.DoGet(ctx, &flight.Ticket{Ticket: []byte("decimal128")})
 	if err != nil {
 		t.Error(err)
 	}
 
-	r, err := ipc.NewFlightDataReader(fdata)
+	r, err := flight.NewRecordReader(fdata)
 	if err != nil {
 		t.Error(err)
 	}

@@ -17,10 +17,12 @@
 
 //! Array expressions
 
-use crate::error::{ExecutionError, Result};
+use crate::error::{DataFusionError, Result};
 use arrow::array::*;
 use arrow::datatypes::DataType;
 use std::sync::Arc;
+
+use super::ColumnarValue;
 
 macro_rules! downcast_vec {
     ($ARGS:expr, $ARRAY_TYPE:ident) => {{
@@ -28,7 +30,7 @@ macro_rules! downcast_vec {
             .iter()
             .map(|e| match e.as_any().downcast_ref::<$ARRAY_TYPE>() {
                 Some(array) => Ok(array),
-                _ => Err(ExecutionError::General("failed to downcast".to_string())),
+                _ => Err(DataFusionError::Internal("failed to downcast".to_string())),
             })
     }};
 }
@@ -58,11 +60,10 @@ macro_rules! array {
     }};
 }
 
-/// put values in an array.
-pub fn array(args: &[ArrayRef]) -> Result<ArrayRef> {
+fn array_array(args: &[&dyn Array]) -> Result<ArrayRef> {
     // do not accept 0 arguments.
-    if args.len() == 0 {
-        return Err(ExecutionError::InternalError(
+    if args.is_empty() {
+        return Err(DataFusionError::Internal(
             "array requires at least one argument".to_string(),
         ));
     }
@@ -81,17 +82,35 @@ pub fn array(args: &[ArrayRef]) -> Result<ArrayRef> {
         DataType::UInt16 => array!(args, UInt16Array, UInt16Builder),
         DataType::UInt32 => array!(args, UInt32Array, UInt32Builder),
         DataType::UInt64 => array!(args, UInt64Array, UInt64Builder),
-        data_type => Err(ExecutionError::NotImplemented(format!(
+        data_type => Err(DataFusionError::NotImplemented(format!(
             "Array is not implemented for type '{:?}'.",
             data_type
         ))),
     }
 }
 
+/// put values in an array.
+pub fn array(values: &[ColumnarValue]) -> Result<ColumnarValue> {
+    let arrays: Vec<&dyn Array> = values
+        .iter()
+        .map(|value| {
+            if let ColumnarValue::Array(value) = value {
+                Ok(value.as_ref())
+            } else {
+                Err(DataFusionError::NotImplemented(
+                    "Array is not implemented for scalar values.".to_string(),
+                ))
+            }
+        })
+        .collect::<Result<_>>()?;
+
+    Ok(ColumnarValue::Array(array_array(&arrays)?))
+}
+
 /// Currently supported types by the array function.
 /// The order of these types correspond to the order on which coercion applies
 /// This should thus be from least informative to most informative
-pub static SUPPORTED_ARRAY_TYPES: &'static [DataType] = &[
+pub static SUPPORTED_ARRAY_TYPES: &[DataType] = &[
     DataType::Boolean,
     DataType::UInt8,
     DataType::UInt16,

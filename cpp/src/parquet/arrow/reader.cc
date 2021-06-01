@@ -30,6 +30,7 @@
 #include "arrow/record_batch.h"
 #include "arrow/table.h"
 #include "arrow/type.h"
+#include "arrow/util/bit_util.h"
 #include "arrow/util/iterator.h"
 #include "arrow/util/logging.h"
 #include "arrow/util/make_unique.h"
@@ -68,6 +69,8 @@ using arrow::internal::Iota;
 using ParquetReader = parquet::ParquetFileReader;
 
 using parquet::internal::RecordReader;
+
+namespace BitUtil = arrow::BitUtil;
 
 namespace parquet {
 namespace arrow {
@@ -322,6 +325,10 @@ class FileReaderImpl : public FileReader {
     reader_properties_.set_use_threads(use_threads);
   }
 
+  void set_batch_size(int64_t batch_size) override {
+    reader_properties_.set_batch_size(batch_size);
+  }
+
   const ArrowReaderProperties& properties() const override { return reader_properties_; }
 
   const SchemaManifest& manifest() const override { return manifest_; }
@@ -540,6 +547,10 @@ class ListReader : public ColumnReaderImpl {
 
   virtual ::arrow::Result<std::shared_ptr<ChunkedArray>> AssembleArray(
       std::shared_ptr<ArrayData> data) {
+    if (field_->type()->id() == ::arrow::Type::MAP) {
+      // Error out if data is not map-compliant instead of aborting in MakeArray below
+      RETURN_NOT_OK(::arrow::MapArray::ValidateChildData(data->child_data));
+    }
     std::shared_ptr<Array> result = ::arrow::MakeArray(data);
     return std::make_shared<ChunkedArray>(result);
   }
@@ -879,8 +890,9 @@ Status FileReaderImpl::GetRecordBatchReader(const std::vector<int>& row_groups,
   if (reader_properties_.pre_buffer()) {
     // PARQUET-1698/PARQUET-1820: pre-buffer row groups/column chunks if enabled
     BEGIN_PARQUET_CATCH_EXCEPTIONS
-    reader_->PreBuffer(row_groups, column_indices, reader_properties_.async_context(),
-                       reader_properties_.cache_options());
+    ARROW_UNUSED(reader_->PreBuffer(row_groups, column_indices,
+                                    reader_properties_.io_context(),
+                                    reader_properties_.cache_options()));
     END_PARQUET_CATCH_EXCEPTIONS
   }
 
@@ -978,9 +990,9 @@ Status FileReaderImpl::ReadRowGroups(const std::vector<int>& row_groups,
   // PARQUET-1698/PARQUET-1820: pre-buffer row groups/column chunks if enabled
   if (reader_properties_.pre_buffer()) {
     BEGIN_PARQUET_CATCH_EXCEPTIONS
-    parquet_reader()->PreBuffer(row_groups, column_indices,
-                                reader_properties_.async_context(),
-                                reader_properties_.cache_options());
+    ARROW_UNUSED(parquet_reader()->PreBuffer(row_groups, column_indices,
+                                             reader_properties_.io_context(),
+                                             reader_properties_.cache_options()));
     END_PARQUET_CATCH_EXCEPTIONS
   }
 

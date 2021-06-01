@@ -698,6 +698,8 @@ We provide a simplified memory-efficient layout for the Null data type
 where all values are null. In this case no memory buffers are
 allocated.
 
+.. _dictionary-encoded-layout:
+
 Dictionary-encoded Layout
 -------------------------
 
@@ -786,6 +788,8 @@ layouts depending on the particular realization of the type.
 
 We do not go into detail about the logical types definitions in this
 document as we consider `Schema.fbs`_ to be authoritative.
+
+.. _format-ipc:
 
 Serialization and Interprocess Communication (IPC)
 ==================================================
@@ -1051,7 +1055,7 @@ the dictionaries can be properly interpreted: ::
 
 The dictionary ``id`` in the message metadata can be referenced one or more times
 in the schema, so that dictionaries can even be used for multiple fields. See
-the :doc:`Layout` document for more about the semantics of
+the :ref:`dictionary-encoded-layout` section for more about the semantics of
 dictionary-encoded data.
 
 The dictionary ``isDelta`` flag allows existing dictionaries to be
@@ -1200,10 +1204,6 @@ never exposed. Before sending data to another system expecting Arrow
 data, these custom vectors should be converted to a type that exist in
 the Arrow spec.
 
-References
-----------
-* Apache Drill Documentation - `Value Vectors`_
-
 .. _Flatbuffers: http://github.com/google/flatbuffers
 .. _Flatbuffers protocol definition files: https://github.com/apache/arrow/tree/master/format
 .. _Schema.fbs: https://github.com/apache/arrow/blob/master/format/Schema.fbs
@@ -1213,4 +1213,3 @@ References
 .. _Endianness: https://en.wikipedia.org/wiki/Endianness
 .. _SIMD: https://software.intel.com/en-us/cpp-compiler-developer-guide-and-reference-introduction-to-the-simd-data-layout-templates
 .. _Parquet: https://parquet.apache.org/documentation/latest/
-.. _Value Vectors: https://drill.apache.org/docs/value-vectors/

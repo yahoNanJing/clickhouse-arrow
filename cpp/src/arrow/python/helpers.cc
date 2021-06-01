@@ -20,18 +20,16 @@
 
 #include "arrow/python/helpers.h"
 
+#include <cmath>
 #include <limits>
-#include <mutex>
 #include <sstream>
 #include <type_traits>
-#include <typeinfo>
 
 #include "arrow/python/common.h"
 #include "arrow/python/decimal.h"
+#include "arrow/type_fwd.h"
 #include "arrow/util/checked_cast.h"
 #include "arrow/util/logging.h"
-
-#include <arrow/api.h>
 
 namespace arrow {
 
@@ -203,7 +201,7 @@ Status CIntFromPythonImpl(PyObject* obj, Int* out, const std::string& overflow_m
   // PyLong_AsUnsignedLong() and PyLong_AsUnsignedLongLong() don't handle
   // conversion from non-ints (e.g. np.uint64), so do it ourselves
   if (!PyLong_Check(obj)) {
-    ref.reset(PyNumber_Long(obj));
+    ref.reset(PyNumber_Index(obj));
     if (!ref) {
       RETURN_IF_PYERROR();
     }
@@ -265,23 +263,39 @@ bool PyFloat_IsNaN(PyObject* obj) {
 
 namespace {
 
-static std::once_flag pandas_static_initialized;
+static bool pandas_static_initialized = false;
 
+// Once initialized, these variables hold borrowed references to Pandas static data.
+// We should not use OwnedRef here because Python destructors would be
+// called on a finalized interpreter.
 static PyObject* pandas_NA = nullptr;
 static PyObject* pandas_NaT = nullptr;
 static PyObject* pandas_Timedelta = nullptr;
 static PyObject* pandas_Timestamp = nullptr;
 static PyTypeObject* pandas_NaTType = nullptr;
 
-void GetPandasStaticSymbols() {
+}  // namespace
+
+void InitPandasStaticData() {
+  // NOTE: This is called with the GIL held.  We needn't (and shouldn't,
+  // to avoid deadlocks) use an additional C++ lock (ARROW-10519).
+  if (pandas_static_initialized) {
+    return;
+  }
+
   OwnedRef pandas;
 
-  // import pandas
+  // Import pandas
   Status s = ImportModule("pandas", &pandas);
   if (!s.ok()) {
     return;
   }
 
+  // Since ImportModule can release the GIL, another thread could have
+  // already initialized the static data.
+  if (pandas_static_initialized) {
+    return;
+  }
   OwnedRef ref;
 
   // set NaT sentinel and its type
@@ -306,12 +320,8 @@ void GetPandasStaticSymbols() {
   if (ImportFromModule(pandas.obj(), "NA", &ref).ok()) {
     pandas_NA = ref.obj();
   }
-}
 
-}  // namespace
-
-void InitPandasStaticData() {
-  std::call_once(pandas_static_initialized, GetPandasStaticSymbols);
+  pandas_static_initialized = true;
 }
 
 bool PandasObjectIsNull(PyObject* obj) {
@@ -338,16 +348,14 @@ bool IsPandasTimestamp(PyObject* obj) {
 }
 
 Status InvalidValue(PyObject* obj, const std::string& why) {
-  std::string obj_as_str;
-  RETURN_NOT_OK(internal::PyObject_StdStringStr(obj, &obj_as_str));
-  return Status::Invalid("Could not convert ", obj_as_str, " with type ",
+  auto obj_as_str = PyObject_StdStringRepr(obj);
+  return Status::Invalid("Could not convert ", std::move(obj_as_str), " with type ",
                          Py_TYPE(obj)->tp_name, ": ", why);
 }
 
 Status InvalidType(PyObject* obj, const std::string& why) {
-  std::string obj_as_str;
-  RETURN_NOT_OK(internal::PyObject_StdStringStr(obj, &obj_as_str));
-  return Status::TypeError("Could not convert ", obj_as_str, " with type ",
+  auto obj_as_str = PyObject_StdStringRepr(obj);
+  return Status::TypeError("Could not convert ", std::move(obj_as_str), " with type ",
                            Py_TYPE(obj)->tp_name, ": ", why);
 }
 

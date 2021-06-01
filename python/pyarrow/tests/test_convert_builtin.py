@@ -20,6 +20,7 @@ import datetime
 import decimal
 import itertools
 import math
+import re
 
 import hypothesis as h
 import numpy as np
@@ -42,7 +43,7 @@ int_type_pairs = [
     (np.uint64, pa.uint64())]
 
 
-np_int_types, _ = zip(*int_type_pairs)
+np_int_types, pa_int_types = zip(*int_type_pairs)
 
 
 class StrangeIterable:
@@ -174,7 +175,7 @@ def test_sequence_boolean(seq):
 
 @parametrize_with_iterable_types
 def test_sequence_numpy_boolean(seq):
-    expected = [np.bool(True), None, np.bool(False), None]
+    expected = [np.bool_(True), None, np.bool_(False), None]
     arr = pa.array(seq(expected))
     assert arr.type == pa.bool_()
     assert arr.to_pylist() == [True, None, False, None]
@@ -431,6 +432,14 @@ def test_unsigned_integer_overflow(bits):
         pa.array([2 ** bits], ty)
     with pytest.raises((OverflowError, pa.ArrowInvalid)):
         pa.array([-1], ty)
+
+
+@parametrize_with_iterable_types
+@pytest.mark.parametrize("typ", pa_int_types)
+def test_integer_from_string_error(seq, typ):
+    # ARROW-9451: pa.array(['1'], type=pa.uint32()) should not succeed
+    with pytest.raises(pa.ArrowInvalid):
+        pa.array(seq(['1']), type=typ)
 
 
 def test_convert_with_mask():
@@ -759,6 +768,16 @@ def test_large_binary_value(ty):
     assert len(arr) == 4
     buf = arr[1].as_buffer()
     assert len(buf) == len(s) * nrepeats
+
+
+@pytest.mark.large_memory
+@pytest.mark.parametrize("ty", [pa.binary(), pa.string()])
+def test_string_too_large(ty):
+    # Construct a binary array with a single value larger than 4GB
+    s = b"0123456789abcdefghijklmnopqrstuvwxyz"
+    nrepeats = math.ceil((2**32 + 5) / len(s))
+    with pytest.raises(pa.ArrowCapacityError):
+        pa.array([b"foo", s * nrepeats, None, b"bar"], type=ty)
 
 
 def test_sequence_bytes():
@@ -1425,61 +1444,61 @@ def test_sequence_mixed_types_with_specified_type_fails():
 
 def test_sequence_decimal():
     data = [decimal.Decimal('1234.183'), decimal.Decimal('8094.234')]
-    type = pa.decimal128(precision=7, scale=3)
-    arr = pa.array(data, type=type)
-    assert arr.to_pylist() == data
+    for type in [pa.decimal128, pa.decimal256]:
+        arr = pa.array(data, type=type(precision=7, scale=3))
+        assert arr.to_pylist() == data
 
 
 def test_sequence_decimal_different_precisions():
     data = [
         decimal.Decimal('1234234983.183'), decimal.Decimal('80943244.234')
     ]
-    type = pa.decimal128(precision=13, scale=3)
-    arr = pa.array(data, type=type)
-    assert arr.to_pylist() == data
+    for type in [pa.decimal128, pa.decimal256]:
+        arr = pa.array(data, type=type(precision=13, scale=3))
+        assert arr.to_pylist() == data
 
 
 def test_sequence_decimal_no_scale():
     data = [decimal.Decimal('1234234983'), decimal.Decimal('8094324')]
-    type = pa.decimal128(precision=10)
-    arr = pa.array(data, type=type)
-    assert arr.to_pylist() == data
+    for type in [pa.decimal128, pa.decimal256]:
+        arr = pa.array(data, type=type(precision=10))
+        assert arr.to_pylist() == data
 
 
 def test_sequence_decimal_negative():
     data = [decimal.Decimal('-1234.234983'), decimal.Decimal('-8.094324')]
-    type = pa.decimal128(precision=10, scale=6)
-    arr = pa.array(data, type=type)
-    assert arr.to_pylist() == data
+    for type in [pa.decimal128, pa.decimal256]:
+        arr = pa.array(data, type=type(precision=10, scale=6))
+        assert arr.to_pylist() == data
 
 
 def test_sequence_decimal_no_whole_part():
     data = [decimal.Decimal('-.4234983'), decimal.Decimal('.0103943')]
-    type = pa.decimal128(precision=7, scale=7)
-    arr = pa.array(data, type=type)
-    assert arr.to_pylist() == data
+    for type in [pa.decimal128, pa.decimal256]:
+        arr = pa.array(data, type=type(precision=7, scale=7))
+        assert arr.to_pylist() == data
 
 
 def test_sequence_decimal_large_integer():
     data = [decimal.Decimal('-394029506937548693.42983'),
             decimal.Decimal('32358695912932.01033')]
-    type = pa.decimal128(precision=23, scale=5)
-    arr = pa.array(data, type=type)
-    assert arr.to_pylist() == data
+    for type in [pa.decimal128, pa.decimal256]:
+        arr = pa.array(data, type=type(precision=23, scale=5))
+        assert arr.to_pylist() == data
 
 
 def test_sequence_decimal_from_integers():
     data = [0, 1, -39402950693754869342983]
     expected = [decimal.Decimal(x) for x in data]
-    type = pa.decimal128(precision=28, scale=5)
-    arr = pa.array(data, type=type)
-    assert arr.to_pylist() == expected
+    for type in [pa.decimal128, pa.decimal256]:
+        arr = pa.array(data, type=type(precision=28, scale=5))
+        assert arr.to_pylist() == expected
 
 
 def test_sequence_decimal_too_high_precision():
-    # ARROW-6989 python decimal created from float has too high precision
+    # ARROW-6989 python decimal has too high precision
     with pytest.raises(ValueError, match="precision out of range"):
-        pa.array([decimal.Decimal(123.234)])
+        pa.array([decimal.Decimal('1' * 80)])
 
 
 def test_range_types():
@@ -1674,7 +1693,7 @@ def test_struct_from_list_of_pairs_errors():
     # type inference
     template = (
         r"Could not convert {} with type {}: was expecting tuple of "
-        r"\(key, value\) pair"
+        r"(key, value) pair"
     )
     cases = [
         tuple(),  # empty key-value pair
@@ -1683,10 +1702,9 @@ def test_struct_from_list_of_pairs_errors():
         'string',  # not a tuple
     ]
     for key_value_pair in cases:
-        msg = template.format(
-            str(key_value_pair).replace('(', r'\(').replace(')', r'\)'),
-            type(key_value_pair).__name__
-        )
+        msg = re.escape(template.format(
+            repr(key_value_pair), type(key_value_pair).__name__
+        ))
 
         with pytest.raises(TypeError, match=msg):
             pa.array([
@@ -1997,6 +2015,18 @@ def test_roundtrip_nanosecond_resolution_pandas_temporal_objects():
     assert arr.equals(restored)
     assert restored.to_pylist() == [
         pd.Timestamp(9223371273709551616, unit='ns')
+    ]
+
+    ty = pa.timestamp('ns', tz='US/Eastern')
+    value = 1604119893000000000
+    arr = pa.array([value], type=ty)
+    data = arr.to_pylist()
+    assert isinstance(data[0], pd.Timestamp)
+    restored = pa.array(data, type=ty)
+    assert arr.equals(restored)
+    assert restored.to_pylist() == [
+        pd.Timestamp(value, unit='ns').tz_localize(
+            "UTC").tz_convert('US/Eastern')
     ]
 
 

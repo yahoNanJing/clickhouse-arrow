@@ -15,6 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#include <cmath>
+
 #include "arrow/compute/kernels/common.h"
 #include "arrow/util/int_util_internal.h"
 #include "arrow/util/macros.h"
@@ -233,6 +235,70 @@ struct DivideChecked {
   }
 };
 
+struct Power {
+  ARROW_NOINLINE
+  static uint64_t IntegerPower(uint64_t base, uint64_t exp) {
+    // right to left O(logn) power
+    uint64_t pow = 1;
+    while (exp) {
+      pow *= (exp & 1) ? base : 1;
+      base *= base;
+      exp >>= 1;
+    }
+    return pow;
+  }
+
+  template <typename T>
+  static enable_if_integer<T> Call(KernelContext* ctx, T base, T exp) {
+    if (exp < 0) {
+      ctx->SetStatus(
+          Status::Invalid("integers to negative integer powers are not allowed"));
+      return 0;
+    }
+    return static_cast<T>(IntegerPower(base, exp));
+  }
+
+  template <typename T>
+  static enable_if_floating_point<T> Call(KernelContext* ctx, T base, T exp) {
+    return std::pow(base, exp);
+  }
+};
+
+struct PowerChecked {
+  template <typename T, typename Arg0, typename Arg1>
+  static enable_if_integer<T> Call(KernelContext* ctx, Arg0 base, Arg1 exp) {
+    if (exp < 0) {
+      ctx->SetStatus(
+          Status::Invalid("integers to negative integer powers are not allowed"));
+      return 0;
+    } else if (exp == 0) {
+      return 1;
+    }
+    // left to right O(logn) power with overflow checks
+    bool overflow = false;
+    uint64_t bitmask =
+        1ULL << (63 - BitUtil::CountLeadingZeros(static_cast<uint64_t>(exp)));
+    T pow = 1;
+    while (bitmask) {
+      overflow |= MultiplyWithOverflow(pow, pow, &pow);
+      if (exp & bitmask) {
+        overflow |= MultiplyWithOverflow(pow, base, &pow);
+      }
+      bitmask >>= 1;
+    }
+    if (overflow) {
+      ctx->SetStatus(Status::Invalid("overflow"));
+    }
+    return pow;
+  }
+
+  template <typename T, typename Arg0, typename Arg1>
+  static enable_if_floating_point<T> Call(KernelContext* ctx, Arg0 base, Arg1 exp) {
+    static_assert(std::is_same<T, Arg0>::value && std::is_same<T, Arg1>::value, "");
+    return std::pow(base, exp);
+  }
+};
+
 // Generate a kernel given an arithmetic functor
 template <template <typename... Args> class KernelGenerator, typename Op>
 ArrayKernelExec NumericEqualTypesBinary(detail::GetTypeId get_id) {
@@ -264,9 +330,31 @@ ArrayKernelExec NumericEqualTypesBinary(detail::GetTypeId get_id) {
   }
 }
 
+struct ArithmeticFunction : ScalarFunction {
+  using ScalarFunction::ScalarFunction;
+
+  Result<const Kernel*> DispatchBest(std::vector<ValueDescr>* values) const override {
+    RETURN_NOT_OK(CheckArity(*values));
+
+    using arrow::compute::detail::DispatchExactImpl;
+    if (auto kernel = DispatchExactImpl(this, *values)) return kernel;
+
+    EnsureDictionaryDecoded(values);
+    ReplaceNullWithOtherType(values);
+
+    if (auto type = CommonNumeric(*values)) {
+      ReplaceTypes(type, values);
+    }
+
+    if (auto kernel = DispatchExactImpl(this, *values)) return kernel;
+    return arrow::compute::detail::NoMatchingKernel(this, *values);
+  }
+};
+
 template <typename Op>
-std::shared_ptr<ScalarFunction> MakeArithmeticFunction(std::string name) {
-  auto func = std::make_shared<ScalarFunction>(name, Arity::Binary());
+std::shared_ptr<ScalarFunction> MakeArithmeticFunction(std::string name,
+                                                       const FunctionDoc* doc) {
+  auto func = std::make_shared<ArithmeticFunction>(name, Arity::Binary(), doc);
   for (const auto& ty : NumericTypes()) {
     auto exec = NumericEqualTypesBinary<ScalarBinaryEqualTypes, Op>(ty);
     DCHECK_OK(func->AddKernel({ty, ty}, ty, exec));
@@ -277,8 +365,9 @@ std::shared_ptr<ScalarFunction> MakeArithmeticFunction(std::string name) {
 // Like MakeArithmeticFunction, but for arithmetic ops that need to run
 // only on non-null output.
 template <typename Op>
-std::shared_ptr<ScalarFunction> MakeArithmeticFunctionNotNull(std::string name) {
-  auto func = std::make_shared<ScalarFunction>(name, Arity::Binary());
+std::shared_ptr<ScalarFunction> MakeArithmeticFunctionNotNull(std::string name,
+                                                              const FunctionDoc* doc) {
+  auto func = std::make_shared<ArithmeticFunction>(name, Arity::Binary(), doc);
   for (const auto& ty : NumericTypes()) {
     auto exec = NumericEqualTypesBinary<ScalarBinaryNotNullEqualTypes, Op>(ty);
     DCHECK_OK(func->AddKernel({ty, ty}, ty, exec));
@@ -286,20 +375,83 @@ std::shared_ptr<ScalarFunction> MakeArithmeticFunctionNotNull(std::string name) 
   return func;
 }
 
+const FunctionDoc add_doc{"Add the arguments element-wise",
+                          ("Results will wrap around on integer overflow.\n"
+                           "Use function \"add_checked\" if you want overflow\n"
+                           "to return an error."),
+                          {"x", "y"}};
+
+const FunctionDoc add_checked_doc{
+    "Add the arguments element-wise",
+    ("This function returns an error on overflow.  For a variant that\n"
+     "doesn't fail on overflow, use function \"add\"."),
+    {"x", "y"}};
+
+const FunctionDoc sub_doc{"Substract the arguments element-wise",
+                          ("Results will wrap around on integer overflow.\n"
+                           "Use function \"subtract_checked\" if you want overflow\n"
+                           "to return an error."),
+                          {"x", "y"}};
+
+const FunctionDoc sub_checked_doc{
+    "Substract the arguments element-wise",
+    ("This function returns an error on overflow.  For a variant that\n"
+     "doesn't fail on overflow, use function \"subtract\"."),
+    {"x", "y"}};
+
+const FunctionDoc mul_doc{"Multiply the arguments element-wise",
+                          ("Results will wrap around on integer overflow.\n"
+                           "Use function \"multiply_checked\" if you want overflow\n"
+                           "to return an error."),
+                          {"x", "y"}};
+
+const FunctionDoc mul_checked_doc{
+    "Multiply the arguments element-wise",
+    ("This function returns an error on overflow.  For a variant that\n"
+     "doesn't fail on overflow, use function \"multiply\"."),
+    {"x", "y"}};
+
+const FunctionDoc div_doc{
+    "Divide the arguments element-wise",
+    ("Integer division by zero returns an error. However, integer overflow\n"
+     "wraps around, and floating-point division by zero returns an infinite.\n"
+     "Use function \"divide_checked\" if you want to get an error\n"
+     "in all the aforementioned cases."),
+    {"dividend", "divisor"}};
+
+const FunctionDoc div_checked_doc{
+    "Divide the arguments element-wise",
+    ("An error is returned when trying to divide by zero, or when\n"
+     "integer overflow is encountered."),
+    {"dividend", "divisor"}};
+
+const FunctionDoc pow_doc{
+    "Raise arguments to power element-wise",
+    ("Integer to negative integer power returns an error. However, integer overflow\n"
+     "wraps around. If either base or exponent is null the result will be null."),
+    {"base", "exponent"}};
+
+const FunctionDoc pow_checked_doc{
+    "Raise arguments to power element-wise",
+    ("An error is returned when integer to negative integer power is encountered,\n"
+     "or integer overflow is encountered."),
+    {"base", "exponent"}};
+
 }  // namespace
 
 void RegisterScalarArithmetic(FunctionRegistry* registry) {
   // ----------------------------------------------------------------------
-  auto add = MakeArithmeticFunction<Add>("add");
+  auto add = MakeArithmeticFunction<Add>("add", &add_doc);
   DCHECK_OK(registry->AddFunction(std::move(add)));
 
   // ----------------------------------------------------------------------
-  auto add_checked = MakeArithmeticFunctionNotNull<AddChecked>("add_checked");
+  auto add_checked =
+      MakeArithmeticFunctionNotNull<AddChecked>("add_checked", &add_checked_doc);
   DCHECK_OK(registry->AddFunction(std::move(add_checked)));
 
   // ----------------------------------------------------------------------
   // subtract
-  auto subtract = MakeArithmeticFunction<Subtract>("subtract");
+  auto subtract = MakeArithmeticFunction<Subtract>("subtract", &sub_doc);
 
   // Add subtract(timestamp, timestamp) -> duration
   for (auto unit : AllTimeUnits()) {
@@ -312,26 +464,36 @@ void RegisterScalarArithmetic(FunctionRegistry* registry) {
   DCHECK_OK(registry->AddFunction(std::move(subtract)));
 
   // ----------------------------------------------------------------------
-  auto subtract_checked =
-      MakeArithmeticFunctionNotNull<SubtractChecked>("subtract_checked");
+  auto subtract_checked = MakeArithmeticFunctionNotNull<SubtractChecked>(
+      "subtract_checked", &sub_checked_doc);
   DCHECK_OK(registry->AddFunction(std::move(subtract_checked)));
 
   // ----------------------------------------------------------------------
-  auto multiply = MakeArithmeticFunction<Multiply>("multiply");
+  auto multiply = MakeArithmeticFunction<Multiply>("multiply", &mul_doc);
   DCHECK_OK(registry->AddFunction(std::move(multiply)));
 
   // ----------------------------------------------------------------------
-  auto multiply_checked =
-      MakeArithmeticFunctionNotNull<MultiplyChecked>("multiply_checked");
+  auto multiply_checked = MakeArithmeticFunctionNotNull<MultiplyChecked>(
+      "multiply_checked", &mul_checked_doc);
   DCHECK_OK(registry->AddFunction(std::move(multiply_checked)));
 
   // ----------------------------------------------------------------------
-  auto divide = MakeArithmeticFunctionNotNull<Divide>("divide");
+  auto divide = MakeArithmeticFunctionNotNull<Divide>("divide", &div_doc);
   DCHECK_OK(registry->AddFunction(std::move(divide)));
 
   // ----------------------------------------------------------------------
-  auto divide_checked = MakeArithmeticFunctionNotNull<DivideChecked>("divide_checked");
+  auto divide_checked =
+      MakeArithmeticFunctionNotNull<DivideChecked>("divide_checked", &div_checked_doc);
   DCHECK_OK(registry->AddFunction(std::move(divide_checked)));
+
+  // ----------------------------------------------------------------------
+  auto power = MakeArithmeticFunction<Power>("power", &pow_doc);
+  DCHECK_OK(registry->AddFunction(std::move(power)));
+
+  // ----------------------------------------------------------------------
+  auto power_checked =
+      MakeArithmeticFunctionNotNull<PowerChecked>("power_checked", &pow_checked_doc);
+  DCHECK_OK(registry->AddFunction(std::move(power_checked)));
 }
 
 }  // namespace internal

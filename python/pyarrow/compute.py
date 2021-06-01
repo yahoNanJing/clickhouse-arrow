@@ -17,7 +17,10 @@
 
 from pyarrow._compute import (  # noqa
     Function,
+    FunctionOptions,
     FunctionRegistry,
+    HashAggregateFunction,
+    HashAggregateKernel,
     Kernel,
     ScalarAggregateFunction,
     ScalarAggregateKernel,
@@ -26,14 +29,27 @@ from pyarrow._compute import (  # noqa
     VectorFunction,
     VectorKernel,
     # Option classes
+    ArraySortOptions,
     CastOptions,
+    CountOptions,
+    DictionaryEncodeOptions,
+    ExtractRegexOptions,
     FilterOptions,
     MatchSubstringOptions,
     MinMaxOptions,
+    ModeOptions,
+    SplitOptions,
+    SplitPatternOptions,
     PartitionNthOptions,
+    ProjectOptions,
+    QuantileOptions,
+    ReplaceSubstringOptions,
     SetLookupOptions,
+    SortOptions,
     StrptimeOptions,
     TakeOptions,
+    TDigestOptions,
+    TrimOptions,
     VarianceOptions,
     # Functions
     function_registry,
@@ -43,8 +59,23 @@ from pyarrow._compute import (  # noqa
 )
 
 from textwrap import dedent
+import warnings
 
 import pyarrow as pa
+
+
+def _get_arg_names(func):
+    arg_names = func._doc.arg_names
+    if not arg_names:
+        if func.arity == 1:
+            arg_names = ["arg"]
+        elif func.arity == 2:
+            arg_names = ["left", "right"]
+        else:
+            raise NotImplementedError(
+                f"unsupported arity: {func.arity} (function: {func.name})")
+
+    return arg_names
 
 
 def _decorate_compute_function(wrapper, exposed_name, func, option_class):
@@ -53,28 +84,40 @@ def _decorate_compute_function(wrapper, exposed_name, func, option_class):
     wrapper.__name__ = exposed_name
     wrapper.__qualname__ = exposed_name
 
-    # TODO (ARROW-9164): expose actual docstring from C++
     doc_pieces = []
-    arg_str = "arguments" if func.arity > 1 else "argument"
-    doc_pieces.append("""\
-        Call compute function {!r} with the given {}.
 
+    cpp_doc = func._doc
+    summary = cpp_doc.summary
+    if not summary:
+        arg_str = "arguments" if func.arity > 1 else "argument"
+        summary = ("Call compute function {!r} with the given {}"
+                   .format(func.name, arg_str))
+
+    description = cpp_doc.description
+    arg_names = _get_arg_names(func)
+
+    doc_pieces.append("""\
+        {}.
+
+        """.format(summary))
+
+    if description:
+        doc_pieces.append("{}\n\n".format(description))
+
+    doc_pieces.append("""\
         Parameters
         ----------
-        """.format(func.name, arg_str))
+        """)
 
-    if func.arity == 1:
+    for arg_name in arg_names:
+        if func.kind in ('vector', 'scalar_aggregate'):
+            arg_type = 'Array-like'
+        else:
+            arg_type = 'Array-like or scalar-like'
         doc_pieces.append("""\
-            arg : Array-like or scalar-like
+            {} : {}
                 Argument to compute function
-            """)
-    elif func.arity == 2:
-        doc_pieces.append("""\
-            left : Array-like or scalar-like
-                First argument to compute function
-            right : Array-like or scalar-like
-                Second argument to compute function
-            """)
+            """.format(arg_name, arg_type))
 
     doc_pieces.append("""\
         memory_pool : pyarrow.MemoryPool, optional
@@ -84,7 +127,7 @@ def _decorate_compute_function(wrapper, exposed_name, func, option_class):
         doc_pieces.append("""\
             options : pyarrow.compute.{0}, optional
                 Parameters altering compute function semantics
-            **kwargs: optional
+            **kwargs : optional
                 Parameters for {0} constructor.  Either `options`
                 or `**kwargs` can be passed, but not both at the same time.
             """.format(option_class.__name__))
@@ -93,20 +136,16 @@ def _decorate_compute_function(wrapper, exposed_name, func, option_class):
     return wrapper
 
 
-_option_classes = {
-    # TODO: export the option class name from C++ metadata?
-    'cast': CastOptions,
-    'filter': FilterOptions,
-    'index_in': SetLookupOptions,
-    'is_in': SetLookupOptions,
-    'match_substring': MatchSubstringOptions,
-    'min_max': MinMaxOptions,
-    'partition_nth_indices': PartitionNthOptions,
-    'stddev': VarianceOptions,
-    'strptime': StrptimeOptions,
-    'take': TakeOptions,
-    'variance': VarianceOptions,
-}
+def _get_options_class(func):
+    class_name = func._doc.options_class
+    if not class_name:
+        return None
+    try:
+        return globals()[class_name]
+    except KeyError:
+        warnings.warn("Python binding for {} not exposed"
+                      .format(class_name), RuntimeWarning)
+        return None
 
 
 def _handle_options(name, option_class, options, kwargs):
@@ -130,32 +169,40 @@ def _handle_options(name, option_class, options, kwargs):
     return options
 
 
-def _simple_unary_function(name):
-    func = get_function(name)
-    option_class = _option_classes.get(name)
+_wrapper_template = dedent("""\
+    def make_wrapper(func, option_class):
+        def {func_name}({args_sig}{kwonly}, memory_pool=None):
+            return func.call([{args_sig}], None, memory_pool)
+        return {func_name}
+    """)
 
+_wrapper_options_template = dedent("""\
+    def make_wrapper(func, option_class):
+        def {func_name}({args_sig}{kwonly}, options=None, memory_pool=None,
+                        **kwargs):
+            options = _handle_options({func_name!r}, option_class, options,
+                                      kwargs)
+            return func.call([{args_sig}], options, memory_pool)
+        return {func_name}
+    """)
+
+
+def _wrap_function(name, func):
+    option_class = _get_options_class(func)
+    arg_names = _get_arg_names(func)
+    args_sig = ', '.join(arg_names)
+    kwonly = '' if arg_names[-1].startswith('*') else ', *'
+
+    # Generate templated wrapper, so that the signature matches
+    # the documented argument names.
+    ns = {}
     if option_class is not None:
-        def wrapper(arg, *, options=None, memory_pool=None, **kwargs):
-            options = _handle_options(name, option_class, options, kwargs)
-            return func.call([arg], options, memory_pool)
+        template = _wrapper_options_template
     else:
-        def wrapper(arg, *, memory_pool=None):
-            return func.call([arg], None, memory_pool)
-
-    return _decorate_compute_function(wrapper, name, func, option_class)
-
-
-def _simple_binary_function(name):
-    func = get_function(name)
-    option_class = _option_classes.get(name)
-
-    if option_class is not None:
-        def wrapper(left, right, *, options=None, memory_pool=None, **kwargs):
-            options = _handle_options(name, option_class, options, kwargs)
-            return func.call([left, right], options, memory_pool)
-    else:
-        def wrapper(left, right, *, memory_pool=None):
-            return func.call([left, right], None, memory_pool)
+        template = _wrapper_template
+    exec(template.format(func_name=name, args_sig=args_sig, kwonly=kwonly),
+         globals(), ns)
+    wrapper = ns['make_wrapper'](func, option_class)
 
     return _decorate_compute_function(wrapper, name, func, option_class)
 
@@ -170,16 +217,15 @@ def _make_global_functions():
     g = globals()
     reg = function_registry()
 
-    for name in reg.list_functions():
+    # Avoid clashes with Python keywords
+    rewrites = {'and': 'and_',
+                'or': 'or_'}
+
+    for cpp_name in reg.list_functions():
+        name = rewrites.get(cpp_name, cpp_name)
+        func = reg.get_function(cpp_name)
         assert name not in g, name
-        func = reg.get_function(name)
-        if func.arity == 1:
-            g[name] = _simple_unary_function(name)
-        elif func.arity == 2:
-            g[name] = _simple_binary_function(name)
-        else:
-            raise NotImplementedError("Unsupported function arity: ",
-                                      func.arity)
+        g[cpp_name] = g[name] = _wrap_function(name, func)
 
 
 _make_global_functions()
@@ -261,6 +307,24 @@ def match_substring(array, pattern):
                          MatchSubstringOptions(pattern))
 
 
+def match_substring_regex(array, pattern):
+    """
+    Test if regex *pattern* matches at any position a value of a string array.
+
+    Parameters
+    ----------
+    array : pyarrow.Array or pyarrow.ChunkedArray
+    pattern : str
+        regex pattern to search
+
+    Returns
+    -------
+    result : pyarrow.Array or pyarrow.ChunkedArray
+    """
+    return call_function("match_substring_regex", [array],
+                         MatchSubstringOptions(pattern))
+
+
 def sum(array):
     """
     Sum the values in a numerical (chunked) array.
@@ -276,11 +340,11 @@ def sum(array):
     return call_function('sum', [array])
 
 
-def mode(array):
+def mode(array, n=1):
     """
-    Return the mode (most common value) of a passed numerical
-    (chunked) array. If there is more than one such value, only
-    the smallest is returned.
+    Return top-n most common values and number of times they occur in a passed
+    numerical (chunked) array, in descending order of occurance. If there are
+    more than one values with same count, smaller one is returned first.
 
     Parameters
     ----------
@@ -288,18 +352,21 @@ def mode(array):
 
     Returns
     -------
-    mode : pyarrow.StructScalar
+    An array of <input type "Mode", int64_t "Count"> structs
 
     Examples
     --------
     >>> import pyarrow as pa
     >>> import pyarrow.compute as pc
     >>> arr = pa.array([1, 1, 2, 2, 3, 2, 2, 2])
-    >>> pc.mode(arr)
+    >>> modes = pc.mode(arr, 2)
+    >>> modes[0]
     <pyarrow.StructScalar: {'mode': 2, 'count': 5}>
-
+    >>> modes[1]
+    <pyarrow.StructScalar: {'mode': 1, 'count': 2}>
     """
-    return call_function("mode", [array])
+    options = ModeOptions(n=n)
+    return call_function("mode", [array], options)
 
 
 def filter(data, mask, null_selection_behavior='drop'):
@@ -425,7 +492,3 @@ def fill_null(values, fill_value):
         fill_value = pa.scalar(fill_value.as_py(), type=values.type)
 
     return call_function("fill_null", [values, fill_value])
-
-
-and_ = globals()['and']
-or_ = globals()['or']

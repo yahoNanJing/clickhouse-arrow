@@ -49,7 +49,7 @@ pub enum ColumnReader {
 /// column reader will read from pages in `col_page_reader`.
 pub fn get_column_reader(
     col_descr: ColumnDescPtr,
-    col_page_reader: Box<PageReader>,
+    col_page_reader: Box<dyn PageReader>,
 ) -> ColumnReader {
     match col_descr.physical_type() {
         Type::BOOLEAN => ColumnReader::BoolColumnReader(ColumnReaderImpl::new(
@@ -106,7 +106,7 @@ pub struct ColumnReaderImpl<T: DataType> {
     descr: ColumnDescPtr,
     def_level_decoder: Option<LevelDecoder>,
     rep_level_decoder: Option<LevelDecoder>,
-    page_reader: Box<PageReader>,
+    page_reader: Box<dyn PageReader>,
     current_encoding: Option<Encoding>,
 
     // The total number of values stored in the data page.
@@ -117,12 +117,12 @@ pub struct ColumnReaderImpl<T: DataType> {
     num_decoded_values: u32,
 
     // Cache of decoders for existing encodings
-    decoders: HashMap<Encoding, Box<Decoder<T>>>,
+    decoders: HashMap<Encoding, Box<dyn Decoder<T>>>,
 }
 
 impl<T: DataType> ColumnReaderImpl<T> {
     /// Creates new column reader based on column descriptor and page reader.
-    pub fn new(descr: ColumnDescPtr, page_reader: Box<PageReader>) -> Self {
+    pub fn new(descr: ColumnDescPtr, page_reader: Box<dyn PageReader>) -> Self {
         Self {
             descr,
             def_level_decoder: None,
@@ -410,6 +410,7 @@ impl<T: DataType> ColumnReaderImpl<T> {
                 .expect("Decoder for dict should have been set")
         } else {
             // Search cache for data page decoder
+            #[allow(clippy::map_entry)]
             if !self.decoders.contains_key(&encoding) {
                 // Initialize decoder for this page
                 let data_decoder = get_decoder::<T>(self.descr.clone(), encoding)?;
@@ -504,7 +505,7 @@ mod tests {
     use super::*;
 
     use rand::distributions::uniform::SampleUniform;
-    use std::{collections::VecDeque, rc::Rc, vec::IntoIter};
+    use std::{collections::VecDeque, sync::Arc, vec::IntoIter};
 
     use crate::basic::Type as PhysicalType;
     use crate::column::page::Page;
@@ -560,9 +561,8 @@ mod tests {
      $min:expr, $max:expr) => {
             #[test]
             fn $test_func() {
-                let desc = Rc::new(ColumnDescriptor::new(
-                    Rc::new($pty()),
-                    None,
+                let desc = Arc::new(ColumnDescriptor::new(
+                    Arc::new($pty()),
                     $def_level,
                     $rep_level,
                     ColumnPath::new(Vec::new()),
@@ -946,9 +946,8 @@ mod tests {
         // Note: values are chosen to reproduce the issue.
         //
         let primitive_type = get_test_int32_type();
-        let desc = Rc::new(ColumnDescriptor::new(
-            Rc::new(primitive_type),
-            None,
+        let desc = Arc::new(ColumnDescriptor::new(
+            Arc::new(primitive_type),
             1,
             1,
             ColumnPath::new(Vec::new()),
@@ -1025,7 +1024,7 @@ mod tests {
     fn get_test_int32_type() -> SchemaType {
         SchemaType::primitive_type_builder("a", PhysicalType::INT32)
             .with_repetition(Repetition::REQUIRED)
-            .with_logical_type(LogicalType::INT_32)
+            .with_converted_type(ConvertedType::INT_32)
             .with_length(-1)
             .build()
             .expect("build() should be OK")
@@ -1035,7 +1034,7 @@ mod tests {
     fn get_test_int64_type() -> SchemaType {
         SchemaType::primitive_type_builder("a", PhysicalType::INT64)
             .with_repetition(Repetition::REQUIRED)
-            .with_logical_type(LogicalType::INT_64)
+            .with_converted_type(ConvertedType::INT_64)
             .with_length(-1)
             .build()
             .expect("build() should be OK")
@@ -1064,9 +1063,8 @@ mod tests {
             0
         };
 
-        let desc = Rc::new(ColumnDescriptor::new(
-            Rc::new(primitive_type),
-            None,
+        let desc = Arc::new(ColumnDescriptor::new(
+            Arc::new(primitive_type),
             max_def_level,
             max_rep_level,
             ColumnPath::new(Vec::new()),

@@ -25,9 +25,9 @@ import java.util.stream.Collectors;
 import org.apache.arrow.flatbuf.RecordBatch;
 import org.apache.arrow.memory.ArrowBuf;
 import org.apache.arrow.memory.BufferAllocator;
-import org.apache.arrow.util.DataSizeRoundingUtil;
 import org.apache.arrow.util.Preconditions;
 import org.apache.arrow.vector.compression.NoCompressionCodec;
+import org.apache.arrow.vector.util.DataSizeRoundingUtil;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -194,14 +194,14 @@ public class ArrowRecordBatch implements ArrowMessage {
     RecordBatch.startBuffersVector(builder, buffers.size());
     int buffersOffset = FBSerializables.writeAllStructsToVector(builder, buffersLayout);
     int compressOffset = 0;
-    if (bodyCompression != null && bodyCompression != NoCompressionCodec.DEFAULT_BODY_COMPRESSION) {
+    if (bodyCompression.getCodec() != NoCompressionCodec.COMPRESSION_TYPE) {
       compressOffset = bodyCompression.writeTo(builder);
     }
     RecordBatch.startRecordBatch(builder);
     RecordBatch.addLength(builder, length);
     RecordBatch.addNodes(builder, nodesOffset);
     RecordBatch.addBuffers(builder, buffersOffset);
-    if (bodyCompression != null && bodyCompression != NoCompressionCodec.DEFAULT_BODY_COMPRESSION) {
+    if (bodyCompression.getCodec() != NoCompressionCodec.COMPRESSION_TYPE) {
       RecordBatch.addCompression(builder, compressOffset);
     }
     return RecordBatch.endRecordBatch(builder);

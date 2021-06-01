@@ -22,11 +22,10 @@ use std::sync::Arc;
 
 use arrow::csv;
 use arrow::datatypes::{DataType, Field, Schema};
-use arrow::error::Result;
 #[cfg(feature = "prettyprint")]
 use arrow::util::pretty::print_batches;
 
-fn main() -> Result<()> {
+fn main() {
     let schema = Schema::new(vec![
         Field::new("city", DataType::Utf8, false),
         Field::new("lat", DataType::Float64, false),
@@ -35,11 +34,10 @@ fn main() -> Result<()> {
 
     let file = File::open("test/data/uk_cities.csv").unwrap();
 
-    let mut csv = csv::Reader::new(file, Arc::new(schema), false, None, 1024, None);
+    let mut csv = csv::Reader::new(file, Arc::new(schema), false, None, 1024, None, None);
     let _batch = csv.next().unwrap().unwrap();
     #[cfg(feature = "prettyprint")]
     {
         print_batches(&[_batch]).unwrap();
     }
-    Ok(())
 }

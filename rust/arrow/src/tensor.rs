@@ -147,7 +147,7 @@ impl<'a, T: ArrowPrimitiveType> Tensor<'a, T> {
                 let total_elements: usize = s.iter().product();
                 if total_elements != (buffer.len() / mem::size_of::<T::Native>()) {
                     return Err(ArrowError::InvalidArgumentError(
-                        "number of elements in buffer does not match dimensios"
+                        "number of elements in buffer does not match dimensions"
                             .to_string(),
                     ));
                 }
@@ -180,7 +180,7 @@ impl<'a, T: ArrowPrimitiveType> Tensor<'a, T> {
         };
 
         Ok(Self {
-            data_type: T::get_data_type(),
+            data_type: T::DATA_TYPE,
             buffer,
             shape,
             strides: tensor_strides,
@@ -359,7 +359,7 @@ mod tests {
     fn test_tensor() {
         let mut builder = Int32BufferBuilder::new(16);
         for i in 0..16 {
-            builder.append(i).unwrap();
+            builder.append(i);
         }
         let buf = builder.finish();
         let tensor = Int32Tensor::try_new(buf, Some(vec![2, 8]), None, None).unwrap();
@@ -374,7 +374,7 @@ mod tests {
     fn test_new_row_major() {
         let mut builder = Int32BufferBuilder::new(16);
         for i in 0..16 {
-            builder.append(i).unwrap();
+            builder.append(i);
         }
         let buf = builder.finish();
         let tensor = Int32Tensor::new_row_major(buf, Some(vec![2, 8]), None).unwrap();
@@ -392,7 +392,7 @@ mod tests {
     fn test_new_column_major() {
         let mut builder = Int32BufferBuilder::new(16);
         for i in 0..16 {
-            builder.append(i).unwrap();
+            builder.append(i);
         }
         let buf = builder.finish();
         let tensor = Int32Tensor::new_column_major(buf, Some(vec![2, 8]), None).unwrap();
@@ -410,7 +410,7 @@ mod tests {
     fn test_with_names() {
         let mut builder = Int64BufferBuilder::new(8);
         for i in 0..8 {
-            builder.append(i).unwrap();
+            builder.append(i);
         }
         let buf = builder.finish();
         let names = vec!["Dim 1", "Dim 2"];
@@ -431,7 +431,7 @@ mod tests {
     fn test_inconsistent_strides() {
         let mut builder = Int32BufferBuilder::new(16);
         for i in 0..16 {
-            builder.append(i).unwrap();
+            builder.append(i);
         }
         let buf = builder.finish();
 
@@ -447,7 +447,7 @@ mod tests {
     fn test_inconsistent_names() {
         let mut builder = Int32BufferBuilder::new(16);
         for i in 0..16 {
-            builder.append(i).unwrap();
+            builder.append(i);
         }
         let buf = builder.finish();
 
@@ -467,7 +467,7 @@ mod tests {
     fn test_incorrect_shape() {
         let mut builder = Int32BufferBuilder::new(16);
         for i in 0..16 {
-            builder.append(i).unwrap();
+            builder.append(i);
         }
         let buf = builder.finish();
 
@@ -482,7 +482,7 @@ mod tests {
     fn test_incorrect_stride() {
         let mut builder = Int32BufferBuilder::new(16);
         for i in 0..16 {
-            builder.append(i).unwrap();
+            builder.append(i);
         }
         let buf = builder.finish();
 

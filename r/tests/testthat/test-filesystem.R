@@ -81,9 +81,13 @@ test_that("SubTreeFilesystem", {
   file.copy(DESCRIPTION, file.path(td, "DESCRIPTION"))
 
   st_fs <- SubTreeFileSystem$create(td)
-  expect_is(st_fs, "SubTreeFileSystem")
-  expect_is(st_fs, "FileSystem")
-  expect_is(st_fs$base_fs, "LocalFileSystem")
+  expect_r6_class(st_fs, "SubTreeFileSystem")
+  expect_r6_class(st_fs, "FileSystem")
+  expect_r6_class(st_fs$base_fs, "LocalFileSystem")
+  expect_identical(
+    capture.output(print(st_fs)),
+    paste0("SubTreeFileSystem: ", "file://", st_fs$base_path)
+  )
 
   # FIXME windows has a trailing slash for one but not the other
   # expect_identical(normalizePath(st_fs$base_path), normalizePath(td))
@@ -133,7 +137,7 @@ test_that("FileSystem$from_uri", {
   skip_on_cran()
   skip_if_not_available("s3")
   fs_and_path <- FileSystem$from_uri("s3://ursa-labs-taxi-data")
-  expect_is(fs_and_path$fs, "S3FileSystem")
+  expect_r6_class(fs_and_path$fs, "S3FileSystem")
   expect_identical(fs_and_path$fs$region, "us-east-2")
 })
 
@@ -141,23 +145,31 @@ test_that("SubTreeFileSystem$create() with URI", {
   skip_on_cran()
   skip_if_not_available("s3")
   fs <- SubTreeFileSystem$create("s3://ursa-labs-taxi-data")
-  expect_is(fs, "SubTreeFileSystem")
+  expect_r6_class(fs, "SubTreeFileSystem")
+  expect_identical(
+    capture.output(print(fs)),
+    "SubTreeFileSystem: s3://ursa-labs-taxi-data/"
+  )
 })
 
 test_that("S3FileSystem", {
   skip_on_cran()
   skip_if_not_available("s3")
   s3fs <- S3FileSystem$create()
-  expect_is(s3fs, "S3FileSystem")
+  expect_r6_class(s3fs, "S3FileSystem")
 })
 
 test_that("s3_bucket", {
   skip_on_cran()
   skip_if_not_available("s3")
   bucket <- s3_bucket("ursa-labs-r-test")
-  expect_is(bucket, "SubTreeFileSystem")
-  expect_is(bucket$base_fs, "S3FileSystem")
+  expect_r6_class(bucket, "SubTreeFileSystem")
+  expect_r6_class(bucket$base_fs, "S3FileSystem")
   expect_identical(bucket$region, "us-west-2")
+  expect_identical(
+    capture.output(print(bucket)),
+    "SubTreeFileSystem: s3://ursa-labs-r-test/"
+  )
   skip_on_os("windows") # FIXME
   expect_identical(bucket$base_path, "ursa-labs-r-test/")
 })

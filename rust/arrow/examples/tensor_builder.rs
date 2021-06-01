@@ -18,7 +18,7 @@
 ///! Tensor builder example
 extern crate arrow;
 
-use arrow::array::*; //{BufferBuilderTrait, Int32BufferBuilder, Float32BufferBuilder};
+use arrow::array::*; //{Int32BufferBuilder, Float32BufferBuilder};
 use arrow::buffer::Buffer;
 use arrow::datatypes::ToByteSlice;
 use arrow::error::Result;
@@ -30,7 +30,7 @@ fn main() -> Result<()> {
     // to match the required size for each buffer
     let mut builder = Int32BufferBuilder::new(16);
     for i in 0..16 {
-        builder.append(i).unwrap();
+        builder.append(i);
     }
     let buf = builder.finish();
 
@@ -43,10 +43,10 @@ fn main() -> Result<()> {
 
     // Creating a tensor using float type buffer builder
     let mut builder = Float32BufferBuilder::new(4);
-    builder.append(1.0).unwrap();
-    builder.append(2.0).unwrap();
-    builder.append(3.0).unwrap();
-    builder.append(4.0).unwrap();
+    builder.append(1.0);
+    builder.append(2.0);
+    builder.append(3.0);
+    builder.append(4.0);
     let buf = builder.finish();
 
     // When building the tensor the buffer and shape are necessary
@@ -57,7 +57,7 @@ fn main() -> Result<()> {
     println!("{:?}", tensor);
 
     // In order to build a tensor from an array the function to_byte_slice add the
-    // required padding to the elements in the the array.
+    // required padding to the elements in the array.
     let buf = Buffer::from(&[0, 1, 2, 3, 4, 5, 6, 7, 9, 10].to_byte_slice());
     let tensor = Int32Tensor::try_new(buf, Some(vec![2, 5]), None, None)?;
     println!("\nInt32 Tensor");

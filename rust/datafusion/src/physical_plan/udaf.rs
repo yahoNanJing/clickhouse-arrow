@@ -18,7 +18,8 @@
 //! This module contains functions and structs supporting user-defined aggregate functions.
 
 use fmt::{Debug, Formatter};
-use std::{cell::RefCell, fmt, rc::Rc};
+use std::any::Any;
+use std::fmt;
 
 use arrow::{
     datatypes::Field,
@@ -64,6 +65,12 @@ impl Debug for AggregateUDF {
     }
 }
 
+impl PartialEq for AggregateUDF {
+    fn eq(&self, other: &Self) -> bool {
+        self.name == other.name && self.signature == other.signature
+    }
+}
+
 impl AggregateUDF {
     /// Create a new AggregateUDF
     pub fn new(
@@ -96,7 +103,7 @@ impl AggregateUDF {
 /// This function errors when `args`' can't be coerced to a valid argument type of the UDAF.
 pub fn create_aggregate_expr(
     fun: &AggregateUDF,
-    args: &Vec<Arc<dyn PhysicalExpr>>,
+    args: &[Arc<dyn PhysicalExpr>],
     input_schema: &Schema,
     name: String,
 ) -> Result<Arc<dyn AggregateExpr>> {
@@ -112,7 +119,7 @@ pub fn create_aggregate_expr(
         fun: fun.clone(),
         args: args.clone(),
         data_type: (fun.return_type)(&arg_types)?.as_ref().clone(),
-        name: name.clone(),
+        name,
     }))
 }
 
@@ -126,6 +133,11 @@ pub struct AggregateFunctionExpr {
 }
 
 impl AggregateExpr for AggregateFunctionExpr {
+    /// Return a reference to Any that can be used for downcasting
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
     fn expressions(&self) -> Vec<Arc<dyn PhysicalExpr>> {
         self.args.clone()
     }
@@ -150,7 +162,7 @@ impl AggregateExpr for AggregateFunctionExpr {
         Ok(Field::new(&self.name, self.data_type.clone(), true))
     }
 
-    fn create_accumulator(&self) -> Result<Rc<RefCell<dyn Accumulator>>> {
+    fn create_accumulator(&self) -> Result<Box<dyn Accumulator>> {
         (self.fun.accumulator)()
     }
 }

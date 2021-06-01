@@ -29,19 +29,19 @@ RUN \
     /etc/apt/apt.conf.d/disable-install-recommends
 
 ARG DEBUG
-ARG LLVM
 RUN \
   quiet=$([ "${DEBUG}" = "yes" ] || echo "-qq") && \
   apt update ${quiet} && \
   apt install -y -V ${quiet} \
     build-essential \
+    ccache \
+    clang \
     cmake \
     debhelper \
     devscripts \
     git \
     gtk-doc-tools \
     libboost-filesystem-dev \
-    libboost-regex-dev \
     libboost-system-dev \
     libbrotli-dev \
     libbz2-dev \
@@ -58,6 +58,7 @@ RUN \
     libthrift-dev \
     libutf8proc-dev \
     libzstd-dev \
+    llvm-dev \
     lsb-release \
     ninja-build \
     pkg-config \
@@ -68,11 +69,6 @@ RUN \
     rapidjson-dev \
     tzdata \
     zlib1g-dev && \
-  if [ "$(dpkg --print-architecture)" != "arm64" ]; then \
-    apt install -y -V ${quiet} \
-      clang-${LLVM} \
-      llvm-${LLVM}-dev; \
-  fi && \
   if apt list | grep '^nvidia-cuda-toolkit/'; then \
     apt install -y -V ${quiet} nvidia-cuda-toolkit; \
   fi && \

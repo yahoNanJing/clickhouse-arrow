@@ -19,7 +19,6 @@
 extern crate criterion;
 use criterion::Criterion;
 
-use std::env;
 use std::sync::{Arc, Mutex};
 
 extern crate arrow;
@@ -32,13 +31,12 @@ use datafusion::execution::context::ExecutionContext;
 
 use tokio::runtime::Runtime;
 
-async fn run_query(ctx: Arc<Mutex<ExecutionContext>>, sql: &str) {
+fn query(ctx: Arc<Mutex<ExecutionContext>>, sql: &str) {
+    let rt = Runtime::new().unwrap();
+
     // execute the query
     let df = ctx.lock().unwrap().sql(&sql).unwrap();
-    let results = df.collect().await.unwrap();
-
-    // display the relation
-    for _batch in results {}
+    rt.block_on(df.collect()).unwrap();
 }
 
 fn create_context() -> Arc<Mutex<ExecutionContext>> {
@@ -59,7 +57,7 @@ fn create_context() -> Arc<Mutex<ExecutionContext>> {
         Field::new("c13", DataType::Utf8, false),
     ]));
 
-    let testdata = env::var("ARROW_TEST_DATA").expect("ARROW_TEST_DATA not defined");
+    let testdata = arrow::util::test_util::arrow_test_data();
 
     // create CSV data source
     let csv = CsvFile::try_new(
@@ -68,17 +66,23 @@ fn create_context() -> Arc<Mutex<ExecutionContext>> {
     )
     .unwrap();
 
-    let mut rt = Runtime::new().unwrap();
+    let rt = Runtime::new().unwrap();
 
     let ctx_holder: Arc<Mutex<Vec<Arc<Mutex<ExecutionContext>>>>> =
         Arc::new(Mutex::new(vec![]));
+
+    let partitions = 16;
+
     rt.block_on(async {
-        let mem_table = MemTable::load(&csv, 16 * 1024).await.unwrap();
+        let mem_table = MemTable::load(Arc::new(csv), 16 * 1024, Some(partitions))
+            .await
+            .unwrap();
 
         // create local execution context
         let mut ctx = ExecutionContext::new();
-        ctx.state.config.concurrency = 1;
-        ctx.register_table("aggregate_test_100", Box::new(mem_table));
+        ctx.state.lock().unwrap().config.concurrency = 1;
+        ctx.register_table("aggregate_test_100", Arc::new(mem_table))
+            .unwrap();
         ctx_holder.lock().unwrap().push(Arc::new(Mutex::new(ctx)))
     });
 
@@ -90,11 +94,11 @@ fn criterion_benchmark(c: &mut Criterion) {
     c.bench_function("sort_and_limit_by_int", |b| {
         let ctx = create_context();
         b.iter(|| {
-            run_query(
+            query(
                 ctx.clone(),
                 "SELECT c1, c13, c6, c10 \
                  FROM aggregate_test_100 \
-                 ORDER BY 3
+                 ORDER BY c6
                  LIMIT 10",
             )
         })
@@ -103,11 +107,11 @@ fn criterion_benchmark(c: &mut Criterion) {
     c.bench_function("sort_and_limit_by_float", |b| {
         let ctx = create_context();
         b.iter(|| {
-            run_query(
+            query(
                 ctx.clone(),
                 "SELECT c1, c13, c12 \
                  FROM aggregate_test_100 \
-                 ORDER BY 2
+                 ORDER BY c13
                  LIMIT 10",
             )
         })
@@ -116,11 +120,11 @@ fn criterion_benchmark(c: &mut Criterion) {
     c.bench_function("sort_and_limit_lex_by_int", |b| {
         let ctx = create_context();
         b.iter(|| {
-            run_query(
+            query(
                 ctx.clone(),
                 "SELECT c1, c13, c6, c10 \
                  FROM aggregate_test_100 \
-                 ORDER BY 3 DESC, 4 DESC
+                 ORDER BY c6 DESC, c10 DESC
                  LIMIT 10",
             )
         })
@@ -129,11 +133,11 @@ fn criterion_benchmark(c: &mut Criterion) {
     c.bench_function("sort_and_limit_lex_by_string", |b| {
         let ctx = create_context();
         b.iter(|| {
-            run_query(
+            query(
                 ctx.clone(),
                 "SELECT c1, c13, c6, c10 \
                  FROM aggregate_test_100 \
-                 ORDER BY 1, 2
+                 ORDER BY c1, c13
                  LIMIT 10",
             )
         })

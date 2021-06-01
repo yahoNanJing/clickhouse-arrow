@@ -19,6 +19,8 @@
 
 from cython.operator cimport dereference as deref
 
+from collections import namedtuple
+
 from pyarrow.lib import frombytes, tobytes, ordered_dict
 from pyarrow.lib cimport *
 from pyarrow.includes.libarrow cimport *
@@ -56,6 +58,17 @@ cdef wrap_scalar_aggregate_function(const shared_ptr[CFunction]& sp_func):
     return func
 
 
+cdef wrap_hash_aggregate_function(const shared_ptr[CFunction]& sp_func):
+    """
+    Wrap a C++ aggregate Function in a HashAggregateFunction object.
+    """
+    cdef HashAggregateFunction func = (
+        HashAggregateFunction.__new__(HashAggregateFunction)
+    )
+    func.init(sp_func)
+    return func
+
+
 cdef wrap_meta_function(const shared_ptr[CFunction]& sp_func):
     """
     Wrap a C++ meta Function in a MetaFunction object.
@@ -83,6 +96,8 @@ cdef wrap_function(const shared_ptr[CFunction]& sp_func):
         return wrap_vector_function(sp_func)
     elif c_kind == FunctionKind_SCALAR_AGGREGATE:
         return wrap_scalar_aggregate_function(sp_func)
+    elif c_kind == FunctionKind_HASH_AGGREGATE:
+        return wrap_hash_aggregate_function(sp_func)
     elif c_kind == FunctionKind_META:
         return wrap_meta_function(sp_func)
     else:
@@ -110,6 +125,16 @@ cdef wrap_scalar_aggregate_kernel(const CScalarAggregateKernel* c_kernel):
         raise ValueError('Kernel was NULL')
     cdef ScalarAggregateKernel kernel = (
         ScalarAggregateKernel.__new__(ScalarAggregateKernel)
+    )
+    kernel.init(c_kernel)
+    return kernel
+
+
+cdef wrap_hash_aggregate_kernel(const CHashAggregateKernel* c_kernel):
+    if c_kernel == NULL:
+        raise ValueError('Kernel was NULL')
+    cdef HashAggregateKernel kernel = (
+        HashAggregateKernel.__new__(HashAggregateKernel)
     )
     kernel.init(c_kernel)
     return kernel
@@ -163,6 +188,23 @@ cdef class ScalarAggregateKernel(Kernel):
                 .format(frombytes(self.kernel.signature.get().ToString())))
 
 
+cdef class HashAggregateKernel(Kernel):
+    cdef:
+        const CHashAggregateKernel* kernel
+
+    cdef void init(self, const CHashAggregateKernel* kernel) except *:
+        self.kernel = kernel
+
+    def __repr__(self):
+        return ("HashAggregateKernel<{}>"
+                .format(frombytes(self.kernel.signature.get().ToString())))
+
+
+FunctionDoc = namedtuple(
+    "FunctionDoc",
+    ("summary", "description", "arg_names", "options_class"))
+
+
 cdef class Function(_Weakrefable):
     """
     A compute function.
@@ -183,8 +225,12 @@ cdef class Function(_Weakrefable):
       in each input.  Examples: dictionary encoding, sorting, extracting
       unique values...
 
-    * "aggregate" functions reduce the dimensionality of the inputs by
-      applying a reduction function.  Examples: sum, minmax, mode...
+    * "scalar_aggregate" functions reduce the dimensionality of the inputs by
+      applying a reduction function.  Examples: sum, min_max, mode...
+
+    * "hash_aggregate" functions apply a reduction function to an input
+      subdivided by grouping criteria.  They may not be directly called.
+      Examples: hash_sum, hash_min_max...
 
     * "meta" functions dispatch to other functions.
     """
@@ -242,10 +288,24 @@ cdef class Function(_Weakrefable):
             return 'vector'
         elif c_kind == FunctionKind_SCALAR_AGGREGATE:
             return 'scalar_aggregate'
+        elif c_kind == FunctionKind_HASH_AGGREGATE:
+            return 'hash_aggregate'
         elif c_kind == FunctionKind_META:
             return 'meta'
         else:
             raise NotImplementedError("Unknown Function::Kind")
+
+    @property
+    def _doc(self):
+        """
+        The C++-like function documentation (for internal use).
+        """
+        cdef CFunctionDoc c_doc = self.base_func.doc()
+
+        return FunctionDoc(frombytes(c_doc.summary),
+                           frombytes(c_doc.description),
+                           [frombytes(s) for s in c_doc.arg_names],
+                           frombytes(c_doc.options_class))
 
     @property
     def num_kernels(self):
@@ -330,6 +390,25 @@ cdef class ScalarAggregateFunction(Function):
             self.func.kernels()
         )
         return [wrap_scalar_aggregate_kernel(k) for k in kernels]
+
+
+cdef class HashAggregateFunction(Function):
+    cdef:
+        const CHashAggregateFunction* func
+
+    cdef void init(self, const shared_ptr[CFunction]& sp_func) except *:
+        Function.init(self, sp_func)
+        self.func = <const CHashAggregateFunction*> sp_func.get()
+
+    @property
+    def kernels(self):
+        """
+        The kernels implementing this function.
+        """
+        cdef vector[const CHashAggregateKernel*] kernels = (
+            self.func.kernels()
+        )
+        return [wrap_hash_aggregate_kernel(k) for k in kernels]
 
 
 cdef class MetaFunction(Function):
@@ -452,13 +531,28 @@ cdef class FunctionOptions(_Weakrefable):
         raise NotImplementedError("Unimplemented base options")
 
 
-cdef class CastOptions(FunctionOptions):
+# NOTE:
+# To properly expose the constructor signature of FunctionOptions
+# subclasses, we use a two-level inheritance:
+# 1. a C extension class that implements option validation and setting
+#    (won't expose function signatures because of
+#     https://github.com/cython/cython/issues/3873)
+# 2. a Python derived class that implements the constructor
+
+cdef class _CastOptions(FunctionOptions):
+    cdef:
+        unique_ptr[CCastOptions] options
 
     __slots__ = ()  # avoid mistakingly creating attributes
 
-    def __init__(self, DataType target_type=None, *, allow_int_overflow=None,
-                 allow_time_truncate=None, allow_time_overflow=None,
-                 allow_float_truncate=None, allow_invalid_utf8=None):
+    cdef const CFunctionOptions* get_options(self) except NULL:
+        return self.options.get()
+
+    def _set_options(self, DataType target_type, allow_int_overflow,
+                     allow_time_truncate, allow_time_overflow,
+                     allow_float_truncate, allow_invalid_utf8):
+        self.options.reset(new CCastOptions())
+        self._set_type(target_type)
         if allow_int_overflow is not None:
             self.allow_int_overflow = allow_int_overflow
         if allow_time_truncate is not None:
@@ -470,166 +564,341 @@ cdef class CastOptions(FunctionOptions):
         if allow_invalid_utf8 is not None:
             self.allow_invalid_utf8 = allow_invalid_utf8
 
-    cdef const CFunctionOptions* get_options(self) except NULL:
-        return &self.options
-
-    @staticmethod
-    cdef wrap(CCastOptions options):
-        cdef CastOptions self = CastOptions.__new__(CastOptions)
-        self.options = options
-        return self
-
-    cdef inline CCastOptions unwrap(self) nogil:
-        return self.options
-
-    @staticmethod
-    def safe(target_type=None):
-        options = CastOptions.wrap(CCastOptions.Safe())
-        options._set_type(target_type)
-        return options
-
-    @staticmethod
-    def unsafe(target_type=None):
-        options = CastOptions.wrap(CCastOptions.Unsafe())
-        options._set_type(target_type)
-        return options
-
     def _set_type(self, target_type=None):
         if target_type is not None:
-            self.options.to_type = (
+            deref(self.options).to_type = (
                 (<DataType> ensure_type(target_type)).sp_type
             )
 
+    def _set_safe(self):
+        self.options.reset(new CCastOptions(CCastOptions.Safe()))
+
+    def _set_unsafe(self):
+        self.options.reset(new CCastOptions(CCastOptions.Unsafe()))
+
     def is_safe(self):
         return not (
-            self.options.allow_int_overflow or
-            self.options.allow_time_truncate or
-            self.options.allow_time_overflow or
-            self.options.allow_float_truncate or
-            self.options.allow_invalid_utf8
+            deref(self.options).allow_int_overflow or
+            deref(self.options).allow_time_truncate or
+            deref(self.options).allow_time_overflow or
+            deref(self.options).allow_float_truncate or
+            deref(self.options).allow_invalid_utf8
         )
 
     @property
     def allow_int_overflow(self):
-        return self.options.allow_int_overflow
+        return deref(self.options).allow_int_overflow
 
     @allow_int_overflow.setter
     def allow_int_overflow(self, bint flag):
-        self.options.allow_int_overflow = flag
+        deref(self.options).allow_int_overflow = flag
 
     @property
     def allow_time_truncate(self):
-        return self.options.allow_time_truncate
+        return deref(self.options).allow_time_truncate
 
     @allow_time_truncate.setter
     def allow_time_truncate(self, bint flag):
-        self.options.allow_time_truncate = flag
+        deref(self.options).allow_time_truncate = flag
 
     @property
     def allow_time_overflow(self):
-        return self.options.allow_time_overflow
+        return deref(self.options).allow_time_overflow
 
     @allow_time_overflow.setter
     def allow_time_overflow(self, bint flag):
-        self.options.allow_time_overflow = flag
+        deref(self.options).allow_time_overflow = flag
 
     @property
     def allow_float_truncate(self):
-        return self.options.allow_float_truncate
+        return deref(self.options).allow_float_truncate
 
     @allow_float_truncate.setter
     def allow_float_truncate(self, bint flag):
-        self.options.allow_float_truncate = flag
+        deref(self.options).allow_float_truncate = flag
 
     @property
     def allow_invalid_utf8(self):
-        return self.options.allow_invalid_utf8
+        return deref(self.options).allow_invalid_utf8
 
     @allow_invalid_utf8.setter
     def allow_invalid_utf8(self, bint flag):
-        self.options.allow_invalid_utf8 = flag
+        deref(self.options).allow_invalid_utf8 = flag
 
 
-cdef class MatchSubstringOptions(FunctionOptions):
+class CastOptions(_CastOptions):
+
+    def __init__(self, target_type=None, *, allow_int_overflow=None,
+                 allow_time_truncate=None, allow_time_overflow=None,
+                 allow_float_truncate=None, allow_invalid_utf8=None):
+        self._set_options(target_type, allow_int_overflow,
+                          allow_time_truncate, allow_time_overflow,
+                          allow_float_truncate, allow_invalid_utf8)
+
+    @staticmethod
+    def safe(target_type=None):
+        self = CastOptions()
+        self._set_safe()
+        self._set_type(target_type)
+        return self
+
+    @staticmethod
+    def unsafe(target_type=None):
+        self = CastOptions()
+        self._set_unsafe()
+        self._set_type(target_type)
+        return self
+
+
+cdef class _MatchSubstringOptions(FunctionOptions):
     cdef:
         unique_ptr[CMatchSubstringOptions] match_substring_options
-
-    def __init__(self, pattern):
-        self.match_substring_options.reset(
-            new CMatchSubstringOptions(tobytes(pattern)))
 
     cdef const CFunctionOptions* get_options(self) except NULL:
         return self.match_substring_options.get()
 
+    def _set_options(self, pattern):
+        self.match_substring_options.reset(
+            new CMatchSubstringOptions(tobytes(pattern)))
 
-cdef class FilterOptions(FunctionOptions):
+
+class MatchSubstringOptions(_MatchSubstringOptions):
+    def __init__(self, pattern):
+        self._set_options(pattern)
+
+
+cdef class _TrimOptions(FunctionOptions):
     cdef:
-        CFilterOptions filter_options
+        unique_ptr[CTrimOptions] trim_options
 
-    def __init__(self, null_selection_behavior='drop'):
+    cdef const CFunctionOptions* get_options(self) except NULL:
+        return self.trim_options.get()
+
+    def _set_options(self, characters):
+        self.trim_options.reset(
+            new CTrimOptions(tobytes(characters)))
+
+
+class TrimOptions(_TrimOptions):
+    def __init__(self, characters):
+        self._set_options(characters)
+
+
+cdef class _ReplaceSubstringOptions(FunctionOptions):
+    cdef:
+        unique_ptr[CReplaceSubstringOptions] replace_substring_options
+
+    cdef const CFunctionOptions* get_options(self) except NULL:
+        return self.replace_substring_options.get()
+
+    def _set_options(self, pattern, replacement, max_replacements):
+        self.replace_substring_options.reset(
+            new CReplaceSubstringOptions(tobytes(pattern),
+                                         tobytes(replacement),
+                                         max_replacements)
+        )
+
+
+class ReplaceSubstringOptions(_ReplaceSubstringOptions):
+    def __init__(self, pattern, replacement, max_replacements=-1):
+        self._set_options(pattern, replacement, max_replacements)
+
+
+cdef class _ExtractRegexOptions(FunctionOptions):
+    cdef:
+        unique_ptr[CExtractRegexOptions] extract_regex_options
+
+    cdef const CFunctionOptions* get_options(self) except NULL:
+        return self.extract_regex_options.get()
+
+    def _set_options(self, pattern):
+        self.extract_regex_options.reset(
+            new CExtractRegexOptions(tobytes(pattern)))
+
+
+class ExtractRegexOptions(_ExtractRegexOptions):
+    def __init__(self, pattern):
+        self._set_options(pattern)
+
+
+cdef class _FilterOptions(FunctionOptions):
+    cdef:
+        unique_ptr[CFilterOptions] filter_options
+
+    cdef const CFunctionOptions* get_options(self) except NULL:
+        return self.filter_options.get()
+
+    def _set_options(self, null_selection_behavior):
         if null_selection_behavior == 'drop':
-            self.filter_options.null_selection_behavior = (
-                CFilterNullSelectionBehavior_DROP
-            )
+            self.filter_options.reset(
+                new CFilterOptions(CFilterNullSelectionBehavior_DROP))
         elif null_selection_behavior == 'emit_null':
-            self.filter_options.null_selection_behavior = (
-                CFilterNullSelectionBehavior_EMIT_NULL
-            )
+            self.filter_options.reset(
+                new CFilterOptions(CFilterNullSelectionBehavior_EMIT_NULL))
         else:
             raise ValueError(
                 '"{}" is not a valid null_selection_behavior'
                 .format(null_selection_behavior))
 
-    cdef const CFunctionOptions* get_options(self) except NULL:
-        return &self.filter_options
+
+class FilterOptions(_FilterOptions):
+    def __init__(self, null_selection_behavior='drop'):
+        self._set_options(null_selection_behavior)
 
 
-cdef class TakeOptions(FunctionOptions):
+cdef class _DictionaryEncodeOptions(FunctionOptions):
     cdef:
-        CTakeOptions take_options
-
-    def __init__(self, *, boundscheck=True):
-        self.take_options.boundscheck = boundscheck
+        unique_ptr[CDictionaryEncodeOptions] dictionary_encode_options
 
     cdef const CFunctionOptions* get_options(self) except NULL:
-        return &self.take_options
+        return self.dictionary_encode_options.get()
+
+    def _set_options(self, null_encoding_behavior):
+        if null_encoding_behavior == 'encode':
+            self.dictionary_encode_options.reset(
+                new CDictionaryEncodeOptions(
+                    CDictionaryEncodeNullEncodingBehavior_ENCODE))
+        elif null_encoding_behavior == 'mask':
+            self.dictionary_encode_options.reset(
+                new CDictionaryEncodeOptions(
+                    CDictionaryEncodeNullEncodingBehavior_MASK))
+        else:
+            raise ValueError('"{}" is not a valid null_encoding_behavior'
+                             .format(null_encoding_behavior))
 
 
-cdef class PartitionNthOptions(FunctionOptions):
+class DictionaryEncodeOptions(_DictionaryEncodeOptions):
+    def __init__(self, null_encoding_behavior='mask'):
+        self._set_options(null_encoding_behavior)
+
+
+cdef class _TakeOptions(FunctionOptions):
+    cdef:
+        unique_ptr[CTakeOptions] take_options
+
+    cdef const CFunctionOptions* get_options(self) except NULL:
+        return self.take_options.get()
+
+    def _set_options(self, boundscheck):
+        self.take_options.reset(new CTakeOptions(boundscheck))
+
+
+class TakeOptions(_TakeOptions):
+    def __init__(self, *, boundscheck=True):
+        self._set_options(boundscheck)
+
+
+cdef class _PartitionNthOptions(FunctionOptions):
     cdef:
         unique_ptr[CPartitionNthOptions] partition_nth_options
-
-    def __cinit__(self, int64_t pivot):
-        self.partition_nth_options.reset(new CPartitionNthOptions(pivot))
 
     cdef const CFunctionOptions* get_options(self) except NULL:
         return self.partition_nth_options.get()
 
+    def _set_options(self, int64_t pivot):
+        self.partition_nth_options.reset(new CPartitionNthOptions(pivot))
 
-cdef class MinMaxOptions(FunctionOptions):
+
+class PartitionNthOptions(_PartitionNthOptions):
+    def __init__(self, int64_t pivot):
+        self._set_options(pivot)
+
+
+cdef class _ProjectOptions(FunctionOptions):
     cdef:
-        CMinMaxOptions min_max_options
-
-    def __init__(self, null_handling='skip'):
-        if null_handling == 'skip':
-            self.min_max_options.null_handling = CMinMaxMode_SKIP
-        elif null_handling == 'emit_null':
-            self.min_max_options.null_handling = CMinMaxMode_EMIT_NULL
-        else:
-            raise ValueError(
-                '"{}" is not a valid null_handling'
-                .format(null_handling))
+        unique_ptr[CProjectOptions] project_options
 
     cdef const CFunctionOptions* get_options(self) except NULL:
-        return &self.min_max_options
+        return self.project_options.get()
+
+    def _set_options(self, field_names):
+        cdef:
+            vector[c_string] c_field_names
+        for n in field_names:
+            c_field_names.push_back(tobytes(n))
+        self.project_options.reset(new CProjectOptions(field_names))
 
 
-cdef class SetLookupOptions(FunctionOptions):
+class ProjectOptions(_ProjectOptions):
+    def __init__(self, field_names):
+        self._set_options(field_names)
+
+
+cdef class _MinMaxOptions(FunctionOptions):
+    cdef:
+        unique_ptr[CMinMaxOptions] min_max_options
+
+    cdef const CFunctionOptions* get_options(self) except NULL:
+        return self.min_max_options.get()
+
+    def _set_options(self, null_handling):
+        if null_handling == 'skip':
+            self.min_max_options.reset(
+                new CMinMaxOptions(CMinMaxMode_SKIP))
+        elif null_handling == 'emit_null':
+            self.min_max_options.reset(
+                new CMinMaxOptions(CMinMaxMode_EMIT_NULL))
+        else:
+            raise ValueError(
+                '{!r} is not a valid null_handling'
+                .format(null_handling))
+
+
+class MinMaxOptions(_MinMaxOptions):
+    def __init__(self, null_handling='skip'):
+        self._set_options(null_handling)
+
+
+cdef class _CountOptions(FunctionOptions):
+    cdef:
+        unique_ptr[CCountOptions] count_options
+
+    cdef const CFunctionOptions* get_options(self) except NULL:
+        return self.count_options.get()
+
+    def _set_options(self, count_mode):
+        if count_mode == 'count_null':
+            self.count_options.reset(
+                new CCountOptions(CCountMode_COUNT_NULL))
+        elif count_mode == 'count_non_null':
+            self.count_options.reset(
+                new CCountOptions(CCountMode_COUNT_NON_NULL))
+        else:
+            raise ValueError(
+                '{!r} is not a valid count_mode'
+                .format(count_mode))
+
+
+class CountOptions(_CountOptions):
+    def __init__(self, count_mode='count_non_null'):
+        self._set_options(count_mode)
+
+
+cdef class _ModeOptions(FunctionOptions):
+    cdef:
+        unique_ptr[CModeOptions] mode_options
+
+    cdef const CFunctionOptions* get_options(self) except NULL:
+        return self.mode_options.get()
+
+    def _set_options(self, n):
+        self.mode_options.reset(new CModeOptions(n))
+
+
+class ModeOptions(_ModeOptions):
+    def __init__(self, n=1):
+        self._set_options(n)
+
+
+cdef class _SetLookupOptions(FunctionOptions):
     cdef:
         unique_ptr[CSetLookupOptions] set_lookup_options
         unique_ptr[CDatum] valset
 
-    def __cinit__(self, *, value_set, c_bool skip_null):
+    cdef const CFunctionOptions* get_options(self) except NULL:
+        return self.set_lookup_options.get()
+
+    def _set_options(self, value_set, c_bool skip_nulls):
         if isinstance(value_set, Array):
             self.valset.reset(new CDatum((<Array> value_set).sp_array))
         elif isinstance(value_set, ChunkedArray):
@@ -642,19 +911,24 @@ cdef class SetLookupOptions(FunctionOptions):
             raise ValueError('"{}" is not a valid value_set'.format(value_set))
 
         self.set_lookup_options.reset(
-            new CSetLookupOptions(deref(self.valset), skip_null)
+            new CSetLookupOptions(deref(self.valset), skip_nulls)
         )
 
-    cdef const CFunctionOptions* get_options(self) except NULL:
-        return self.set_lookup_options.get()
+
+class SetLookupOptions(_SetLookupOptions):
+    def __init__(self, *, value_set, skip_nulls=False):
+        self._set_options(value_set, skip_nulls)
 
 
-cdef class StrptimeOptions(FunctionOptions):
+cdef class _StrptimeOptions(FunctionOptions):
     cdef:
         unique_ptr[CStrptimeOptions] strptime_options
         TimeUnit time_unit
 
-    def __cinit__(self, format, unit):
+    cdef const CFunctionOptions* get_options(self) except NULL:
+        return self.strptime_options.get()
+
+    def _set_options(self, format, unit):
         if unit == 's':
             self.time_unit = TimeUnit_SECOND
         elif unit == 'ms':
@@ -670,16 +944,166 @@ cdef class StrptimeOptions(FunctionOptions):
             new CStrptimeOptions(tobytes(format), self.time_unit)
         )
 
-    cdef const CFunctionOptions* get_options(self) except NULL:
-        return self.strptime_options.get()
+
+class StrptimeOptions(_StrptimeOptions):
+    def __init__(self, format, unit):
+        self._set_options(format, unit)
 
 
-cdef class VarianceOptions(FunctionOptions):
+cdef class _VarianceOptions(FunctionOptions):
     cdef:
-        CVarianceOptions variance_options
-
-    def __cinit__(self, *, ddof=0):
-        self.variance_options.ddof = ddof
+        unique_ptr[CVarianceOptions] variance_options
 
     cdef const CFunctionOptions* get_options(self) except NULL:
-        return &self.variance_options
+        return self.variance_options.get()
+
+    def _set_options(self, ddof):
+        self.variance_options.reset(new CVarianceOptions(ddof))
+
+
+class VarianceOptions(_VarianceOptions):
+    def __init__(self, *, ddof=0):
+        self._set_options(ddof)
+
+
+cdef class _SplitOptions(FunctionOptions):
+    cdef:
+        unique_ptr[CSplitOptions] split_options
+
+    cdef const CFunctionOptions* get_options(self) except NULL:
+        return self.split_options.get()
+
+    def _set_options(self, max_splits, reverse):
+        self.split_options.reset(
+            new CSplitOptions(max_splits, reverse))
+
+
+class SplitOptions(_SplitOptions):
+    def __init__(self, *, max_splits=-1, reverse=False):
+        self._set_options(max_splits, reverse)
+
+
+cdef class _SplitPatternOptions(FunctionOptions):
+    cdef:
+        unique_ptr[CSplitPatternOptions] split_pattern_options
+
+    cdef const CFunctionOptions* get_options(self) except NULL:
+        return self.split_pattern_options.get()
+
+    def _set_options(self, pattern, max_splits, reverse):
+        self.split_pattern_options.reset(
+            new CSplitPatternOptions(tobytes(pattern), max_splits, reverse))
+
+
+class SplitPatternOptions(_SplitPatternOptions):
+    def __init__(self, *, pattern, max_splits=-1, reverse=False):
+        self._set_options(pattern, max_splits, reverse)
+
+
+cdef class _ArraySortOptions(FunctionOptions):
+    cdef:
+        unique_ptr[CArraySortOptions] array_sort_options
+
+    cdef const CFunctionOptions* get_options(self) except NULL:
+        return self.array_sort_options.get()
+
+    def _set_options(self, order):
+        if order == "ascending":
+            self.array_sort_options.reset(
+                new CArraySortOptions(CSortOrder_Ascending))
+        elif order == "descending":
+            self.array_sort_options.reset(
+                new CArraySortOptions(CSortOrder_Descending))
+        else:
+            raise ValueError(
+                "{!r} is not a valid order".format(order)
+            )
+
+
+class ArraySortOptions(_ArraySortOptions):
+    def __init__(self, *, order='ascending'):
+        self._set_options(order)
+
+
+cdef class _SortOptions(FunctionOptions):
+    cdef:
+        unique_ptr[CSortOptions] sort_options
+
+    cdef const CFunctionOptions* get_options(self) except NULL:
+        return self.sort_options.get()
+
+    def _set_options(self, sort_keys):
+        cdef:
+            vector[CSortKey] c_sort_keys
+            c_string c_name
+            CSortOrder c_order
+
+        for name, order in sort_keys:
+            if order == "ascending":
+                c_order = CSortOrder_Ascending
+            elif order == "descending":
+                c_order = CSortOrder_Descending
+            else:
+                raise ValueError(
+                    "{!r} is not a valid order".format(order)
+                )
+            c_name = tobytes(name)
+            c_sort_keys.push_back(CSortKey(c_name, c_order))
+
+        self.sort_options.reset(new CSortOptions(c_sort_keys))
+
+
+class SortOptions(_SortOptions):
+    def __init__(self, sort_keys=None):
+        if sort_keys is None:
+            sort_keys = []
+        self._set_options(sort_keys)
+
+
+cdef class _QuantileOptions(FunctionOptions):
+    cdef:
+        unique_ptr[CQuantileOptions] quantile_options
+
+    cdef const CFunctionOptions* get_options(self) except NULL:
+        return self.quantile_options.get()
+
+    def _set_options(self, quantiles, interp):
+        interp_dict = {
+            'linear': CQuantileInterp_LINEAR,
+            'lower': CQuantileInterp_LOWER,
+            'higher': CQuantileInterp_HIGHER,
+            'nearest': CQuantileInterp_NEAREST,
+            'midpoint': CQuantileInterp_MIDPOINT,
+        }
+        if interp not in interp_dict:
+            raise ValueError(
+                '{!r} is not a valid interpolation'
+                .format(interp))
+        self.quantile_options.reset(
+            new CQuantileOptions(quantiles, interp_dict[interp]))
+
+
+class QuantileOptions(_QuantileOptions):
+    def __init__(self, *, q=0.5, interpolation='linear'):
+        if not isinstance(q, (list, tuple, np.ndarray)):
+            q = [q]
+        self._set_options(q, interpolation)
+
+
+cdef class _TDigestOptions(FunctionOptions):
+    cdef:
+        unique_ptr[CTDigestOptions] tdigest_options
+
+    cdef const CFunctionOptions* get_options(self) except NULL:
+        return self.tdigest_options.get()
+
+    def _set_options(self, quantiles, delta, buffer_size):
+        self.tdigest_options.reset(
+            new CTDigestOptions(quantiles, delta, buffer_size))
+
+
+class TDigestOptions(_TDigestOptions):
+    def __init__(self, *, q=0.5, delta=100, buffer_size=500):
+        if not isinstance(q, (list, tuple, np.ndarray)):
+            q = [q]
+        self._set_options(q, delta, buffer_size)

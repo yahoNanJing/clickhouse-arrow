@@ -24,8 +24,16 @@
 #include <limits>
 #include <memory>
 
+#if defined(sun) || defined(__sun)
+#include <stdlib.h>
+#endif
+
+#include "arrow/result.h"
 #include "arrow/status.h"
+#include "arrow/util/io_util.h"
 #include "arrow/util/logging.h"  // IWYU pragma: keep
+#include "arrow/util/optional.h"
+#include "arrow/util/string.h"
 
 #ifdef ARROW_JEMALLOC
 // Needed to support jemalloc 3 and 4
@@ -84,9 +92,87 @@ const char* je_arrow_malloc_conf =
 
 namespace arrow {
 
+namespace {
+
 constexpr size_t kAlignment = 64;
 
-namespace {
+constexpr char kDefaultBackendEnvVar[] = "ARROW_DEFAULT_MEMORY_POOL";
+
+enum class MemoryPoolBackend : uint8_t { System, Jemalloc, Mimalloc };
+
+struct SupportedBackend {
+  const char* name;
+  MemoryPoolBackend backend;
+};
+
+// See ARROW-12248 for why we use static in-function singletons rather than
+// global constants below (in SupportedBackends() and UserSelectedBackend()).
+// In some contexts (especially R bindings) `default_memory_pool()` may be
+// called before all globals are initialized, and then the ARROW_DEFAULT_MEMORY_POOL
+// environment variable would be ignored.
+
+const std::vector<SupportedBackend>& SupportedBackends() {
+  static std::vector<SupportedBackend> backends = {
+  // ARROW-12316: Apple => mimalloc first, then jemalloc
+  //              non-Apple => jemalloc first, then mimalloc
+#if defined(ARROW_JEMALLOC) && !defined(__APPLE__)
+    {"jemalloc", MemoryPoolBackend::Jemalloc},
+#endif
+#ifdef ARROW_MIMALLOC
+    {"mimalloc", MemoryPoolBackend::Mimalloc},
+#endif
+#if defined(ARROW_JEMALLOC) && defined(__APPLE__)
+    {"jemalloc", MemoryPoolBackend::Jemalloc},
+#endif
+    {"system", MemoryPoolBackend::System}
+  };
+  return backends;
+}
+
+// Return the MemoryPoolBackend selected by the user through the
+// ARROW_DEFAULT_MEMORY_POOL environment variable, if any.
+util::optional<MemoryPoolBackend> UserSelectedBackend() {
+  static auto user_selected_backend = []() -> util::optional<MemoryPoolBackend> {
+    auto unsupported_backend = [](const std::string& name) {
+      std::vector<std::string> supported;
+      for (const auto backend : SupportedBackends()) {
+        supported.push_back(std::string("'") + backend.name + "'");
+      }
+      ARROW_LOG(WARNING) << "Unsupported backend '" << name << "' specified in "
+                         << kDefaultBackendEnvVar << " (supported backends are "
+                         << internal::JoinStrings(supported, ", ") << ")";
+    };
+
+    auto maybe_name = internal::GetEnvVar(kDefaultBackendEnvVar);
+    if (!maybe_name.ok()) {
+      return {};
+    }
+    const auto name = *std::move(maybe_name);
+    if (name.empty()) {
+      // An empty environment variable is considered missing
+      return {};
+    }
+    const auto found = std::find_if(
+        SupportedBackends().begin(), SupportedBackends().end(),
+        [&](const SupportedBackend& backend) { return name == backend.name; });
+    if (found != SupportedBackends().end()) {
+      return found->backend;
+    }
+    unsupported_backend(name);
+    return {};
+  }();
+
+  return user_selected_backend;
+}
+
+MemoryPoolBackend DefaultBackend() {
+  auto backend = UserSelectedBackend();
+  if (backend.has_value()) {
+    return backend.value();
+  }
+  struct SupportedBackend default_backend = SupportedBackends().front();
+  return default_backend.backend;
+}
 
 // A static piece of memory for 0-size allocations, so as to return
 // an aligned non-null pointer.
@@ -106,6 +192,11 @@ class SystemAllocator {
     // Special code path for Windows
     *out = reinterpret_cast<uint8_t*>(
         _aligned_malloc(static_cast<size_t>(size), kAlignment));
+    if (!*out) {
+      return Status::OutOfMemory("malloc of size ", size, " failed");
+    }
+#elif defined(sun) || defined(__sun)
+    *out = reinterpret_cast<uint8_t*>(memalign(kAlignment, static_cast<size_t>(size)));
     if (!*out) {
       return Status::OutOfMemory("malloc of size ", size, " failed");
     }
@@ -264,10 +355,6 @@ class MimallocAllocator {
 
 }  // namespace
 
-MemoryPool::MemoryPool() {}
-
-MemoryPool::~MemoryPool() {}
-
 int64_t MemoryPool::max_memory() const { return -1; }
 
 ///////////////////////////////////////////////////////////////////////
@@ -368,16 +455,23 @@ class MimallocMemoryPool : public BaseMemoryPoolImpl<MimallocAllocator> {
 };
 #endif
 
-#ifdef ARROW_JEMALLOC
-using DefaultMemoryPool = JemallocMemoryPool;
-#elif defined(ARROW_MIMALLOC)
-using DefaultMemoryPool = MimallocMemoryPool;
-#else
-using DefaultMemoryPool = SystemMemoryPool;
-#endif
-
 std::unique_ptr<MemoryPool> MemoryPool::CreateDefault() {
-  return std::unique_ptr<MemoryPool>(new DefaultMemoryPool);
+  auto backend = DefaultBackend();
+  switch (backend) {
+    case MemoryPoolBackend::System:
+      return std::unique_ptr<MemoryPool>(new SystemMemoryPool);
+#ifdef ARROW_JEMALLOC
+    case MemoryPoolBackend::Jemalloc:
+      return std::unique_ptr<MemoryPool>(new JemallocMemoryPool);
+#endif
+#ifdef ARROW_MIMALLOC
+    case MemoryPoolBackend::Mimalloc:
+      return std::unique_ptr<MemoryPool>(new MimallocMemoryPool);
+#endif
+    default:
+      ARROW_LOG(FATAL) << "Internal error: cannot create default memory pool";
+      return nullptr;
+  }
 }
 
 static SystemMemoryPool system_pool;
@@ -409,13 +503,22 @@ Status mimalloc_memory_pool(MemoryPool** out) {
 }
 
 MemoryPool* default_memory_pool() {
+  auto backend = DefaultBackend();
+  switch (backend) {
+    case MemoryPoolBackend::System:
+      return &system_pool;
 #ifdef ARROW_JEMALLOC
-  return &jemalloc_pool;
-#elif defined(ARROW_MIMALLOC)
-  return &mimalloc_pool;
-#else
-  return &system_pool;
+    case MemoryPoolBackend::Jemalloc:
+      return &jemalloc_pool;
 #endif
+#ifdef ARROW_MIMALLOC
+    case MemoryPoolBackend::Mimalloc:
+      return &mimalloc_pool;
+#endif
+    default:
+      ARROW_LOG(FATAL) << "Internal error: cannot create default memory pool";
+      return nullptr;
+  }
 }
 
 #define RETURN_IF_JEMALLOC_ERROR(ERR)                  \
@@ -537,5 +640,13 @@ int64_t ProxyMemoryPool::bytes_allocated() const { return impl_->bytes_allocated
 int64_t ProxyMemoryPool::max_memory() const { return impl_->max_memory(); }
 
 std::string ProxyMemoryPool::backend_name() const { return impl_->backend_name(); }
+
+std::vector<std::string> SupportedMemoryBackendNames() {
+  std::vector<std::string> supported;
+  for (const auto backend : SupportedBackends()) {
+    supported.push_back(backend.name);
+  }
+  return supported;
+}
 
 }  // namespace arrow

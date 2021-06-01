@@ -22,7 +22,13 @@
 #include <vector>
 
 #include "arrow/array/array_dict.h"
-#include "arrow/builder.h"
+#include "arrow/array/builder_binary.h"
+#include "arrow/array/builder_decimal.h"
+#include "arrow/array/builder_dict.h"
+#include "arrow/array/builder_nested.h"
+#include "arrow/array/builder_primitive.h"
+#include "arrow/array/builder_time.h"
+#include "arrow/array/builder_union.h"
 #include "arrow/ipc/json_simple.h"
 #include "arrow/type_traits.h"
 #include "arrow/util/checked_cast.h"
@@ -37,6 +43,7 @@
 #include <rapidjson/error/en.h>
 #include <rapidjson/rapidjson.h>
 #include <rapidjson/reader.h>
+#include <rapidjson/writer.h>
 
 namespace rj = arrow::rapidjson;
 
@@ -289,12 +296,14 @@ class FloatConverter final : public ConcreteConverter<FloatConverter<Type, Build
 // ------------------------------------------------------------------------
 // Converter for decimal arrays
 
-template <typename BuilderType = typename TypeTraits<Decimal128Type>::BuilderType>
-class DecimalConverter final : public ConcreteConverter<DecimalConverter<BuilderType>> {
+template <typename DecimalSubtype, typename DecimalValue, typename BuilderType>
+class DecimalConverter final
+    : public ConcreteConverter<
+          DecimalConverter<DecimalSubtype, DecimalValue, BuilderType>> {
  public:
   explicit DecimalConverter(const std::shared_ptr<DataType>& type) {
     this->type_ = type;
-    decimal_type_ = &checked_cast<const Decimal128Type&>(*this->value_type());
+    decimal_type_ = &checked_cast<const DecimalSubtype&>(*this->value_type());
   }
 
   Status Init() override { return this->MakeConcreteBuilder(&builder_); }
@@ -305,9 +314,9 @@ class DecimalConverter final : public ConcreteConverter<DecimalConverter<Builder
     }
     if (json_obj.IsString()) {
       int32_t precision, scale;
-      Decimal128 d;
+      DecimalValue d;
       auto view = util::string_view(json_obj.GetString(), json_obj.GetStringLength());
-      RETURN_NOT_OK(Decimal128::FromString(view, &d, &precision, &scale));
+      RETURN_NOT_OK(DecimalValue::FromString(view, &d, &precision, &scale));
       if (scale != decimal_type_->scale()) {
         return Status::Invalid("Invalid scale for decimal: expected ",
                                decimal_type_->scale(), ", got ", scale);
@@ -321,8 +330,13 @@ class DecimalConverter final : public ConcreteConverter<DecimalConverter<Builder
 
  private:
   std::shared_ptr<BuilderType> builder_;
-  const Decimal128Type* decimal_type_;
+  const DecimalSubtype* decimal_type_;
 };
+
+template <typename BuilderType = typename TypeTraits<Decimal128Type>::BuilderType>
+using Decimal128Converter = DecimalConverter<Decimal128Type, Decimal128, BuilderType>;
+template <typename BuilderType = typename TypeTraits<Decimal256Type>::BuilderType>
+using Decimal256Converter = DecimalConverter<Decimal256Type, Decimal256, BuilderType>;
 
 // ------------------------------------------------------------------------
 // Converter for timestamp arrays
@@ -639,8 +653,11 @@ class StructConverter final : public ConcreteConverter<StructConverter> {
         }
       }
       if (remaining > 0) {
+        rj::StringBuffer sb;
+        rj::Writer<rj::StringBuffer> writer(sb);
+        json_obj.Accept(writer);
         return Status::Invalid("Unexpected members in JSON object for type ",
-                               type_->ToString());
+                               type_->ToString(), " Object: ", sb.GetString());
       }
       return builder_->Append();
     }
@@ -773,7 +790,8 @@ Status GetDictConverter(const std::shared_ptr<DataType>& type,
     PARAM_CONVERTER_CASE(Type::LARGE_BINARY, StringConverter, LargeBinaryType)
     SIMPLE_CONVERTER_CASE(Type::FIXED_SIZE_BINARY, FixedSizeBinaryConverter,
                           FixedSizeBinaryType)
-    SIMPLE_CONVERTER_CASE(Type::DECIMAL, DecimalConverter, Decimal128Type)
+    SIMPLE_CONVERTER_CASE(Type::DECIMAL128, Decimal128Converter, Decimal128Type)
+    SIMPLE_CONVERTER_CASE(Type::DECIMAL256, Decimal256Converter, Decimal256Type)
     default:
       return ConversionNotImplemented(type);
   }
@@ -829,7 +847,8 @@ Status GetConverter(const std::shared_ptr<DataType>& type,
     SIMPLE_CONVERTER_CASE(Type::LARGE_STRING, StringConverter<LargeStringType>)
     SIMPLE_CONVERTER_CASE(Type::LARGE_BINARY, StringConverter<LargeBinaryType>)
     SIMPLE_CONVERTER_CASE(Type::FIXED_SIZE_BINARY, FixedSizeBinaryConverter<>)
-    SIMPLE_CONVERTER_CASE(Type::DECIMAL, DecimalConverter<>)
+    SIMPLE_CONVERTER_CASE(Type::DECIMAL128, Decimal128Converter<>)
+    SIMPLE_CONVERTER_CASE(Type::DECIMAL256, Decimal256Converter<>)
     SIMPLE_CONVERTER_CASE(Type::SPARSE_UNION, UnionConverter)
     SIMPLE_CONVERTER_CASE(Type::DENSE_UNION, UnionConverter)
     SIMPLE_CONVERTER_CASE(Type::INTERVAL_MONTHS, IntegerConverter<MonthIntervalType>)

@@ -18,21 +18,31 @@
 //! Defines the SORT plan
 
 use std::any::Any;
-use std::sync::Arc;
+use std::pin::Pin;
+use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
+use std::time::Instant;
 
-use arrow::array::ArrayRef;
+use async_trait::async_trait;
+use futures::stream::Stream;
+use futures::Future;
+use hashbrown::HashMap;
+
+use pin_project_lite::pin_project;
+
 pub use arrow::compute::SortOptions;
 use arrow::compute::{concat, lexsort_to_indices, take, SortColumn, TakeOptions};
 use arrow::datatypes::SchemaRef;
+use arrow::error::Result as ArrowResult;
 use arrow::record_batch::RecordBatch;
+use arrow::{array::ArrayRef, error::ArrowError};
 
-use crate::error::{ExecutionError, Result};
-use crate::physical_plan::common::RecordBatchIterator;
+use super::{RecordBatchStream, SendableRecordBatchStream};
+use crate::error::{DataFusionError, Result};
 use crate::physical_plan::expressions::PhysicalSortExpr;
-use crate::physical_plan::{common, Distribution, ExecutionPlan, Partitioning};
-
-use super::SendableRecordBatchReader;
-use async_trait::async_trait;
+use crate::physical_plan::{
+    common, Distribution, ExecutionPlan, Partitioning, SQLMetric,
+};
 
 /// Sort execution plan
 #[derive(Debug)]
@@ -41,8 +51,10 @@ pub struct SortExec {
     input: Arc<dyn ExecutionPlan>,
     /// Sort expressions
     expr: Vec<PhysicalSortExpr>,
-    /// Number of threads to execute input partitions on before combining into a single partition
-    concurrency: usize,
+    /// Output rows
+    output_rows: Arc<Mutex<SQLMetric>>,
+    /// Time to sort batches
+    sort_time_nanos: Arc<Mutex<SQLMetric>>,
 }
 
 impl SortExec {
@@ -50,13 +62,23 @@ impl SortExec {
     pub fn try_new(
         expr: Vec<PhysicalSortExpr>,
         input: Arc<dyn ExecutionPlan>,
-        concurrency: usize,
     ) -> Result<Self> {
         Ok(Self {
             expr,
             input,
-            concurrency,
+            output_rows: SQLMetric::counter("outputRows"),
+            sort_time_nanos: SQLMetric::time_nanos("sortTime"),
         })
+    }
+
+    /// Input schema
+    pub fn input(&self) -> &Arc<dyn ExecutionPlan> {
+        &self.input
+    }
+
+    /// Sort expressions
+    pub fn expr(&self) -> &[PhysicalSortExpr] {
+        &self.expr
     }
 }
 
@@ -68,7 +90,7 @@ impl ExecutionPlan for SortExec {
     }
 
     fn schema(&self) -> SchemaRef {
-        self.input.schema().clone()
+        self.input.schema()
     }
 
     fn children(&self) -> Vec<Arc<dyn ExecutionPlan>> {
@@ -92,17 +114,16 @@ impl ExecutionPlan for SortExec {
             1 => Ok(Arc::new(SortExec::try_new(
                 self.expr.clone(),
                 children[0].clone(),
-                self.concurrency,
             )?)),
-            _ => Err(ExecutionError::General(
+            _ => Err(DataFusionError::Internal(
                 "SortExec wrong number of children".to_string(),
             )),
         }
     }
 
-    async fn execute(&self, partition: usize) -> Result<SendableRecordBatchReader> {
+    async fn execute(&self, partition: usize) -> Result<SendableRecordBatchStream> {
         if 0 != partition {
-            return Err(ExecutionError::General(format!(
+            return Err(DataFusionError::Internal(format!(
                 "SortExec invalid partition {}",
                 partition
             )));
@@ -110,74 +131,190 @@ impl ExecutionPlan for SortExec {
 
         // sort needs to operate on a single partition currently
         if 1 != self.input.output_partitioning().partition_count() {
-            return Err(ExecutionError::General(
+            return Err(DataFusionError::Internal(
                 "SortExec requires a single input partition".to_owned(),
             ));
         }
-        let it = self.input.execute(0).await?;
-        let batches = common::collect(it)?;
+        let input = self.input.execute(0).await?;
 
-        // combine all record batches into one for each column
-        let combined_batch = RecordBatch::try_new(
-            self.schema(),
-            self.schema()
-                .fields()
-                .iter()
-                .enumerate()
-                .map(|(i, _)| -> Result<ArrayRef> {
-                    Ok(concat(
-                        &batches
-                            .iter()
-                            .map(|batch| batch.columns()[i].clone())
-                            .collect::<Vec<ArrayRef>>(),
-                    )?)
-                })
-                .collect::<Result<Vec<ArrayRef>>>()?,
-        )?;
-
-        // sort combined record batch
-        let indices = lexsort_to_indices(
-            &self
-                .expr
-                .iter()
-                .map(|e| e.evaluate_to_sort_column(&combined_batch))
-                .collect::<Result<Vec<SortColumn>>>()?,
-        )?;
-
-        // reorder all rows based on sorted indices
-        let sorted_batch = RecordBatch::try_new(
-            self.schema(),
-            combined_batch
-                .columns()
-                .iter()
-                .map(|column| -> Result<ArrayRef> {
-                    Ok(take(
-                        column,
-                        &indices,
-                        // disable bound check overhead since indices are already generated from
-                        // the same record batch
-                        Some(TakeOptions {
-                            check_bounds: false,
-                        }),
-                    )?)
-                })
-                .collect::<Result<Vec<ArrayRef>>>()?,
-        )?;
-
-        Ok(Box::new(RecordBatchIterator::new(
-            self.schema(),
-            vec![Arc::new(sorted_batch)],
+        Ok(Box::pin(SortStream::new(
+            input,
+            self.expr.clone(),
+            self.output_rows.clone(),
+            self.sort_time_nanos.clone(),
         )))
+    }
+
+    fn metrics(&self) -> HashMap<String, SQLMetric> {
+        let mut metrics = HashMap::new();
+        metrics.insert(
+            "outputRows".to_owned(),
+            self.output_rows.lock().unwrap().clone(),
+        );
+        metrics.insert(
+            "sortTime".to_owned(),
+            self.sort_time_nanos.lock().unwrap().clone(),
+        );
+        metrics
+    }
+}
+
+fn sort_batches(
+    batches: &[RecordBatch],
+    schema: &SchemaRef,
+    expr: &[PhysicalSortExpr],
+) -> ArrowResult<Option<RecordBatch>> {
+    if batches.is_empty() {
+        return Ok(None);
+    }
+    // combine all record batches into one for each column
+    let combined_batch = RecordBatch::try_new(
+        schema.clone(),
+        schema
+            .fields()
+            .iter()
+            .enumerate()
+            .map(|(i, _)| {
+                concat(
+                    &batches
+                        .iter()
+                        .map(|batch| batch.column(i).as_ref())
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .collect::<ArrowResult<Vec<ArrayRef>>>()?,
+    )?;
+
+    // sort combined record batch
+    // TODO: pushup the limit expression to sort
+    let indices = lexsort_to_indices(
+        &expr
+            .iter()
+            .map(|e| e.evaluate_to_sort_column(&combined_batch))
+            .collect::<Result<Vec<SortColumn>>>()
+            .map_err(DataFusionError::into_arrow_external_error)?,
+        None,
+    )?;
+
+    // reorder all rows based on sorted indices
+    let sorted_batch = RecordBatch::try_new(
+        schema.clone(),
+        combined_batch
+            .columns()
+            .iter()
+            .map(|column| {
+                take(
+                    column.as_ref(),
+                    &indices,
+                    // disable bound check overhead since indices are already generated from
+                    // the same record batch
+                    Some(TakeOptions {
+                        check_bounds: false,
+                    }),
+                )
+            })
+            .collect::<ArrowResult<Vec<ArrayRef>>>()?,
+    );
+    sorted_batch.map(Some)
+}
+
+pin_project! {
+    struct SortStream {
+        #[pin]
+        output: futures::channel::oneshot::Receiver<ArrowResult<Option<RecordBatch>>>,
+        finished: bool,
+        schema: SchemaRef,
+        output_rows: Arc<Mutex<SQLMetric>>,
+    }
+}
+
+impl SortStream {
+    fn new(
+        input: SendableRecordBatchStream,
+        expr: Vec<PhysicalSortExpr>,
+        output_rows: Arc<Mutex<SQLMetric>>,
+        sort_time: Arc<Mutex<SQLMetric>>,
+    ) -> Self {
+        let (tx, rx) = futures::channel::oneshot::channel();
+
+        let schema = input.schema();
+        tokio::spawn(async move {
+            let schema = input.schema();
+            let sorted_batch = common::collect(input)
+                .await
+                .map_err(DataFusionError::into_arrow_external_error)
+                .and_then(move |batches| {
+                    let now = Instant::now();
+                    let result = sort_batches(&batches, &schema, &expr);
+                    let mut sort_time = sort_time.lock().unwrap();
+                    sort_time.add(now.elapsed().as_nanos() as usize);
+                    result
+                });
+
+            tx.send(sorted_batch)
+        });
+
+        Self {
+            output: rx,
+            finished: false,
+            schema,
+            output_rows,
+        }
+    }
+}
+
+impl Stream for SortStream {
+    type Item = ArrowResult<RecordBatch>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let output_rows = self.output_rows.clone();
+
+        if self.finished {
+            return Poll::Ready(None);
+        }
+
+        // is the output ready?
+        let this = self.project();
+        let output_poll = this.output.poll(cx);
+
+        match output_poll {
+            Poll::Ready(result) => {
+                *this.finished = true;
+
+                // check for error in receiving channel and unwrap actual result
+                let result = match result {
+                    Err(e) => Some(Err(ArrowError::ExternalError(Box::new(e)))), // error receiving
+                    Ok(result) => result.transpose(),
+                };
+
+                if let Some(Ok(batch)) = &result {
+                    let mut output_rows = output_rows.lock().unwrap();
+                    output_rows.add(batch.num_rows());
+                }
+
+                Poll::Ready(result)
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+impl RecordBatchStream for SortStream {
+    fn schema(&self) -> SchemaRef {
+        self.schema.clone()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::physical_plan::csv::{CsvExec, CsvReadOptions};
     use crate::physical_plan::expressions::col;
     use crate::physical_plan::memory::MemoryExec;
     use crate::physical_plan::merge::MergeExec;
+    use crate::physical_plan::{
+        collect,
+        csv::{CsvExec, CsvReadOptions},
+    };
     use crate::test;
     use arrow::array::*;
     use arrow::datatypes::*;
@@ -187,8 +324,13 @@ mod tests {
         let schema = test::aggr_test_schema();
         let partitions = 4;
         let path = test::create_partitioned_csv("aggregate_test_100.csv", partitions)?;
-        let csv =
-            CsvExec::try_new(&path, CsvReadOptions::new().schema(&schema), None, 1024)?;
+        let csv = CsvExec::try_new(
+            &path,
+            CsvReadOptions::new().schema(&schema),
+            None,
+            1024,
+            None,
+        )?;
 
         let sort_exec = Arc::new(SortExec::try_new(
             vec![
@@ -208,11 +350,10 @@ mod tests {
                     options: SortOptions::default(),
                 },
             ],
-            Arc::new(MergeExec::new(Arc::new(csv), 2)),
-            2,
+            Arc::new(MergeExec::new(Arc::new(csv))),
         )?);
 
-        let result: Vec<RecordBatch> = test::execute(sort_exec).await?;
+        let result: Vec<RecordBatch> = collect(sort_exec).await?;
         assert_eq!(result.len(), 1);
 
         let columns = result[0].columns();
@@ -283,14 +424,15 @@ mod tests {
                     },
                 },
             ],
-            Arc::new(MemoryExec::try_new(&vec![vec![batch]], schema, None)?),
-            2,
+            Arc::new(MemoryExec::try_new(&[vec![batch]], schema, None)?),
         )?);
 
         assert_eq!(DataType::Float32, *sort_exec.schema().field(0).data_type());
         assert_eq!(DataType::Float64, *sort_exec.schema().field(1).data_type());
 
-        let result: Vec<RecordBatch> = test::execute(sort_exec).await?;
+        let result: Vec<RecordBatch> = collect(sort_exec.clone()).await?;
+        assert!(sort_exec.metrics().get("sortTime").unwrap().value > 0);
+        assert_eq!(sort_exec.metrics().get("outputRows").unwrap().value, 8);
         assert_eq!(result.len(), 1);
 
         let columns = result[0].columns();

@@ -50,6 +50,7 @@
 #include "arrow/util/uri.h"
 
 #include "arrow/flight/client_auth.h"
+#include "arrow/flight/client_header_internal.h"
 #include "arrow/flight/client_middleware.h"
 #include "arrow/flight/internal.h"
 #include "arrow/flight/middleware.h"
@@ -57,11 +58,11 @@
 #include "arrow/flight/serialization_internal.h"
 #include "arrow/flight/types.h"
 
-namespace pb = arrow::flight::protocol;
-
 namespace arrow {
 
 namespace flight {
+
+namespace pb = arrow::flight::protocol;
 
 const char* kWriteSizeDetailTypeId = "flight::FlightWriteSizeStatusDetail";
 
@@ -89,9 +90,6 @@ std::shared_ptr<FlightWriteSizeStatusDetail> FlightWriteSizeStatusDetail::Unwrap
   return std::dynamic_pointer_cast<FlightWriteSizeStatusDetail>(status.detail());
 }
 
-FlightClientOptions::FlightClientOptions()
-    : write_size_limit_bytes(0), disable_server_verification(false) {}
-
 FlightClientOptions FlightClientOptions::Defaults() { return FlightClientOptions(); }
 
 struct ClientRpc {
@@ -103,6 +101,9 @@ struct ClientRpc {
           std::chrono::time_point_cast<std::chrono::system_clock::time_point::duration>(
               std::chrono::system_clock::now() + options.timeout);
       context.set_deadline(deadline);
+    }
+    for (auto header : options.headers) {
+      context.AddMetadata(header.first, header.second);
     }
   }
 
@@ -660,12 +661,14 @@ class GrpcStreamWriter : public FlightStreamWriter {
     }
     return Status::OK();
   }
+
   Status WriteWithMetadata(const RecordBatch& batch,
                            std::shared_ptr<Buffer> app_metadata) override {
     RETURN_NOT_OK(CheckStarted());
     app_metadata_ = app_metadata;
     return batch_writer_->WriteRecordBatch(batch);
   }
+
   Status DoneWriting() override {
     // Do not CheckStarted - DoneWriting applies to data and metadata
     if (batch_writer_) {
@@ -679,6 +682,7 @@ class GrpcStreamWriter : public FlightStreamWriter {
     }
     return writer_->DoneWriting();
   }
+
   Status Close() override {
     // Do not CheckStarted - Close applies to data and metadata
     if (batch_writer_ && !writer_closed_) {
@@ -692,6 +696,11 @@ class GrpcStreamWriter : public FlightStreamWriter {
       return writer_->Finish(batch_writer_->Close());
     }
     return writer_->Finish(Status::OK());
+  }
+
+  ipc::WriteStats stats() const override {
+    ARROW_CHECK_NE(batch_writer_, nullptr);
+    return batch_writer_->stats();
   }
 
  private:
@@ -848,7 +857,7 @@ namespace {
 // requires root CA certs, even if you are skipping server
 // verification.
 #if defined(GRPC_NAMESPACE_FOR_TLS_CREDENTIALS_OPTIONS)
-constexpr char BLANK_ROOT_PEM[] =
+constexpr char kDummyRootCert[] =
     "-----BEGIN CERTIFICATE-----\n"
     "MIICwzCCAaugAwIBAgIJAM12DOkcaqrhMA0GCSqGSIb3DQEBBQUAMBQxEjAQBgNV\n"
     "BAMTCWxvY2FsaG9zdDAeFw0yMDEwMDcwODIyNDFaFw0zMDEwMDUwODIyNDFaMBQx\n"
@@ -876,15 +885,12 @@ class FlightClient::FlightClientImpl {
     std::stringstream grpc_uri;
     std::shared_ptr<grpc::ChannelCredentials> creds;
     if (scheme == kSchemeGrpc || scheme == kSchemeGrpcTcp || scheme == kSchemeGrpcTls) {
-      grpc_uri << location.uri_->host() << ":" << location.uri_->port_text();
+      grpc_uri << arrow::internal::UriEncodeHost(location.uri_->host()) << ':'
+               << location.uri_->port_text();
 
       if (scheme == kSchemeGrpcTls) {
         if (options.disable_server_verification) {
-#if !defined(GRPC_NAMESPACE_FOR_TLS_CREDENTIALS_OPTIONS)
-          return Status::NotImplemented(
-              "Using encryption with server verification disabled is unsupported. "
-              "Please use a release of Arrow Flight built with gRPC 1.27 or higher.");
-#else
+#if defined(GRPC_NAMESPACE_FOR_TLS_CREDENTIALS_OPTIONS)
           namespace ge = GRPC_NAMESPACE_FOR_TLS_CREDENTIALS_OPTIONS;
 
           // A callback to supply to TlsCredentialsOptions that accepts any server
@@ -897,16 +903,40 @@ class FlightClient::FlightClientImpl {
               return 0;
             }
           };
-
+          auto server_authorization_check = std::make_shared<NoOpTlsAuthorizationCheck>();
           noop_auth_check_ = std::make_shared<ge::TlsServerAuthorizationCheckConfig>(
-              std::make_shared<NoOpTlsAuthorizationCheck>());
+              server_authorization_check);
+#if defined(GRPC_USE_TLS_CHANNEL_CREDENTIALS_OPTIONS)
+          auto certificate_provider =
+              std::make_shared<grpc::experimental::StaticDataCertificateProvider>(
+                  kDummyRootCert);
+#if defined(GRPC_USE_TLS_CHANNEL_CREDENTIALS_OPTIONS_ROOT_CERTS)
+          grpc::experimental::TlsChannelCredentialsOptions tls_options(
+              certificate_provider);
+#else
+          // While gRPC >= 1.36 does not require a root cert (it has a default)
+          // in practice the path it hardcodes is broken. See grpc/grpc#21655.
+          grpc::experimental::TlsChannelCredentialsOptions tls_options;
+          tls_options.set_certificate_provider(certificate_provider);
+#endif
+          tls_options.watch_root_certs();
+          tls_options.set_root_cert_name("dummy");
+          tls_options.set_server_verification_option(
+              grpc_tls_server_verification_option::GRPC_TLS_SKIP_ALL_SERVER_VERIFICATION);
+          tls_options.set_server_authorization_check_config(noop_auth_check_);
+#elif defined(GRPC_NAMESPACE_FOR_TLS_CREDENTIALS_OPTIONS)
           auto materials_config = std::make_shared<ge::TlsKeyMaterialsConfig>();
-          materials_config->set_pem_root_certs(BLANK_ROOT_PEM);
+          materials_config->set_pem_root_certs(kDummyRootCert);
           ge::TlsCredentialsOptions tls_options(
               GRPC_SSL_DONT_REQUEST_CLIENT_CERTIFICATE,
               GRPC_TLS_SKIP_ALL_SERVER_VERIFICATION, materials_config,
               std::shared_ptr<ge::TlsCredentialReloadConfig>(), noop_auth_check_);
+#endif
           creds = ge::TlsCredentials(tls_options);
+#else
+          return Status::NotImplemented(
+              "Using encryption with server verification disabled is unsupported. "
+              "Please use a release of Arrow Flight built with gRPC 1.27 or higher.");
 #endif
         } else {
           grpc::SslCredentialsOptions ssl_options;
@@ -991,6 +1021,30 @@ class FlightClient::FlightClientImpl {
                              "Could not finish writing before closing");
     }
     return Status::OK();
+  }
+
+  arrow::Result<std::pair<std::string, std::string>> AuthenticateBasicToken(
+      const FlightCallOptions& options, const std::string& username,
+      const std::string& password) {
+    // Add basic auth headers to outgoing headers.
+    ClientRpc rpc(options);
+    internal::AddBasicAuthHeaders(&rpc.context, username, password);
+
+    std::shared_ptr<grpc::ClientReaderWriter<pb::HandshakeRequest, pb::HandshakeResponse>>
+        stream = stub_->Handshake(&rpc.context);
+    GrpcClientAuthSender outgoing{stream};
+    GrpcClientAuthReader incoming{stream};
+
+    // Explicitly close our side of the connection.
+    bool finished_writes = stream->WritesDone();
+    RETURN_NOT_OK(internal::FromGrpcStatus(stream->Finish(), &rpc.context));
+    if (!finished_writes) {
+      return MakeFlightError(FlightStatusCode::Internal,
+                             "Could not finish writing before closing");
+    }
+
+    // Grab bearer token from incoming headers.
+    return internal::GetBearerTokenHeader(rpc.context);
   }
 
   Status ListFlights(const FlightCallOptions& options, const Criteria& criteria,
@@ -1183,7 +1237,7 @@ FlightClient::~FlightClient() {}
 
 Status FlightClient::Connect(const Location& location,
                              std::unique_ptr<FlightClient>* client) {
-  return Connect(location, {}, client);
+  return Connect(location, FlightClientOptions::Defaults(), client);
 }
 
 Status FlightClient::Connect(const Location& location, const FlightClientOptions& options,
@@ -1195,6 +1249,12 @@ Status FlightClient::Connect(const Location& location, const FlightClientOptions
 Status FlightClient::Authenticate(const FlightCallOptions& options,
                                   std::unique_ptr<ClientAuthHandler> auth_handler) {
   return impl_->Authenticate(options, std::move(auth_handler));
+}
+
+arrow::Result<std::pair<std::string, std::string>> FlightClient::AuthenticateBasicToken(
+    const FlightCallOptions& options, const std::string& username,
+    const std::string& password) {
+  return impl_->AuthenticateBasicToken(options, username, password);
 }
 
 Status FlightClient::DoAction(const FlightCallOptions& options, const Action& action,
