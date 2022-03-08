@@ -531,8 +531,6 @@ class ORCFileReader::Impl {
     return NextStripeReader(batch_size, empty_vec); 
   }
 
-  liborc::Reader* ORCFileReader::GetRawORCReader() {
-    return impl_->GetRawORCReader();
   }
 
  private:
@@ -545,6 +543,10 @@ class ORCFileReader::Impl {
 ORCFileReader::ORCFileReader() { impl_.reset(new ORCFileReader::Impl()); }
 
 ORCFileReader::~ORCFileReader() {}
+
+liborc::Reader* ORCFileReader::GetRawORCReader() {
+  return impl_->GetRawORCReader();
+}
 
 Result<std::unique_ptr<ORCFileReader>> ORCFileReader::Open(
     const std::shared_ptr<io::RandomAccessFile>& file, MemoryPool* pool) {
