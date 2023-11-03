@@ -2580,7 +2580,7 @@ class DeltaBitPackDecoder : public DecoderImpl, virtual public TypedDecoder<DTyp
   T min_delta_;
   uint32_t mini_block_idx_;
   std::shared_ptr<ResizableBuffer> delta_bit_widths_;
-  int delta_bit_width_;
+  int delta_bit_width_ = 0;
 
   T last_value_;
 };
