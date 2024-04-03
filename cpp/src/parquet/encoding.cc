@@ -499,7 +499,11 @@ class DictEncoderImpl : public EncoderImpl, virtual public DictEncoder<DType> {
         dict_encoded_size_(0),
         memo_table_(pool, kInitialHashTableSize) {}
 
-  ~DictEncoderImpl() override { DCHECK(buffered_indices_.empty()); }
+  ~DictEncoderImpl() override {
+    if (!buffered_indices_.empty()) {
+      ClearIndices();
+    }
+  }
 
   int dict_encoded_size() const override { return dict_encoded_size_; }
 
